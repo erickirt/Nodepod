@@ -104,6 +104,10 @@ export function buildNapiWorkerBundle(
       try {
         const resolved = resolveModule(dep, fromDir);
         if (resolved && !isBuiltin(resolved)) {
+          // Skip .min.js files — they have deeply nested expressions that can
+          // overflow Chrome's parser when embedded in a blob Worker script.
+          // The non-minified .cjs.js versions are functionally identical.
+          if (/\.min\.(js|cjs|mjs)$/.test(resolved)) continue;
           collectDeps(resolved);
         }
       } catch {
@@ -124,16 +128,33 @@ export function buildNapiWorkerBundle(
   parts.push(`const __modules = {};`);
   parts.push(`const __moduleCache = {};`);
 
-  // Register each collected module
+  // Register each collected module.
+  // IMPORTANT: Module source is stored as a STRING, not as a function body.
+  // This avoids V8 parser stack overflow — Chrome's parser has a recursion limit
+  // that blows up when dozens of large module sources are embedded as function
+  // bodies in a single script. By storing as strings, V8 only parses the
+  // top-level string assignments at load time. Each module's code is parsed
+  // lazily via `new Function()` when first required.
   for (const [filePath, source] of modules) {
     const id = moduleIds.get(filePath)!;
     const dir = filePath.substring(0, filePath.lastIndexOf("/")) || "/";
 
-    // Convert ESM to CJS-ish for the module wrapper
-    let transformed = esmToCjs(source);
+    // Only convert ESM → CJS for actual ESM files (.mjs or containing import/export).
+    // CJS files (.cjs, .min.js, etc.) must NOT be converted — the regex mangles minified code.
+    const isESM = filePath.endsWith(".mjs") ||
+      (/\b(import\s+[\w{*]|export\s+(default|const|let|var|function|class|\{|\*))\b/.test(source) &&
+       !source.includes("module.exports") && !source.includes("exports.__esModule"));
+    let transformed = isESM ? esmToCjs(source) : source;
+
+    // Escape the source for embedding as a string literal.
+    // We use a template-literal-safe encoding: backtick, backslash, ${
+    const escaped = transformed
+      .replace(/\\/g, "\\\\")
+      .replace(/`/g, "\\`")
+      .replace(/\$\{/g, "\\${");
 
     parts.push(
-      `__modules[${id}] = { dir: ${JSON.stringify(dir)}, path: ${JSON.stringify(filePath)}, fn: function(module, exports, require, __filename, __dirname) {\n${transformed}\n}};`,
+      `__modules[${id}] = { dir: ${JSON.stringify(dir)}, path: ${JSON.stringify(filePath)}, src: \`${escaped}\` };`,
     );
   }
 
@@ -146,7 +167,14 @@ export function buildNapiWorkerBundle(
   // Entry point execution
   const entryId = moduleIds.get(entryPath);
   if (entryId !== undefined) {
-    parts.push(`__require(${entryId});`);
+    parts.push(`
+try {
+  __require(${entryId});
+} catch(e) {
+  console.error('[worker] Entry point failed:', e?.message || e);
+  if (e?.stack) console.error(e.stack);
+}
+`);
   }
 
   return parts.join("\n");
@@ -373,12 +401,37 @@ function handleFsProxy(
   fsBridge: any,
 ): void {
   const { sab, type, payload } = req;
+  const maxPayload = sab.buffer.byteLength - 16; // SAB size minus 16-byte header
   try {
     const fn = fsBridge[type];
     if (typeof fn !== "function") {
       throw new Error(`fs.${type} is not a function`);
     }
-    const result = fn.apply(fsBridge, payload);
+
+    let result = fn.apply(fsBridge, payload);
+
+    // Convert stat objects to plain serializable objects
+    if ((type === "statSync" || type === "lstatSync") && result && typeof result.isFile === "function") {
+      result = {
+        size: result.size,
+        mode: result.mode,
+        nlink: result.nlink,
+        uid: result.uid,
+        gid: result.gid,
+        dev: result.dev,
+        ino: result.ino,
+        rdev: result.rdev || 0,
+        blksize: result.blksize || 4096,
+        blocks: result.blocks || 0,
+        mtimeMs: result.mtimeMs,
+        atimeMs: result.atimeMs,
+        ctimeMs: result.ctimeMs,
+        birthtimeMs: result.birthtimeMs,
+        _isFile: result.isFile(),
+        _isDir: result.isDirectory(),
+        _isSymlink: typeof result.isSymbolicLink === "function" ? result.isSymbolicLink() : false,
+      };
+    }
 
     // Encode result into the SharedArrayBuffer
     const encoded = encodeValue(result);
@@ -386,9 +439,10 @@ function handleFsProxy(
 
     Atomics.store(sab, 1, resultType);
     Atomics.store(sab, 2, encoded.byteLength);
-    // Write payload into the SharedArrayBuffer (bytes 16+)
-    const payloadView = new Uint8Array(sab.buffer, 16, Math.min(encoded.byteLength, 10240));
-    payloadView.set(encoded.subarray(0, payloadView.length));
+    // Write payload into the SharedArrayBuffer (after 16-byte header)
+    const writeLen = Math.min(encoded.byteLength, maxPayload);
+    const payloadView = new Uint8Array(sab.buffer, 16, writeLen);
+    payloadView.set(encoded.subarray(0, writeLen));
 
     Atomics.store(sab, 0, 0); // success
   } catch (err: any) {
@@ -400,8 +454,9 @@ function handleFsProxy(
 
     Atomics.store(sab, 1, 6); // type = json/object
     Atomics.store(sab, 2, encoded.byteLength);
-    const payloadView = new Uint8Array(sab.buffer, 16, Math.min(encoded.byteLength, 10240));
-    payloadView.set(encoded.subarray(0, payloadView.length));
+    const writeLen = Math.min(encoded.byteLength, maxPayload);
+    const payloadView = new Uint8Array(sab.buffer, 16, writeLen);
+    payloadView.set(encoded.subarray(0, writeLen));
 
     Atomics.store(sab, 0, 1); // error
   } finally {
@@ -563,9 +618,23 @@ function esmToCjs(source: string): string {
 // ────────────────────────────────────────────────────────────────────────────
 
 function WORKER_PREAMBLE(env: Record<string, string>): string {
+  // Inject thread pool size = 0 to disable emnapi's UV thread pool.
+  // Without this, emnapi creates Workers for its async work pool which
+  // crash with TLS corruption in the rolldown WASM binary.
+  const workerEnv = {
+    ...env,
+    UV_THREADPOOL_SIZE: "0",
+    EMNAPI_WORKER_POOL_SIZE: "0",
+    RAYON_NUM_THREADS: "1",
+  };
   return `
 // === nodepod napi-rs WASI worker preamble ===
 "use strict";
+
+// Save reference to native postMessage BEFORE any override.
+// In a Web Worker, self === globalThis, so overriding globalThis.postMessage
+// would shadow self.postMessage causing infinite recursion.
+const __nativePostMessage = self.postMessage.bind(self);
 
 // Bridge parentPort ↔ Web Worker message API
 const __parentPortListeners = [];
@@ -594,7 +663,7 @@ const __parentPort = {
     if (event === 'message') __parentPortListeners.forEach(fn => fn(...args));
     return true;
   },
-  postMessage(data, transfer) { self.postMessage(data, transfer || []); },
+  postMessage(data, transfer) { __nativePostMessage(data, transfer || []); },
   ref() {},
   unref() {},
   removeAllListeners() { __parentPortListeners.length = 0; return __parentPort; },
@@ -602,7 +671,7 @@ const __parentPort = {
 
 // Process stub
 const process = {
-  env: ${JSON.stringify(env)},
+  env: ${JSON.stringify(workerEnv)},
   cwd() { return "/"; },
   platform: "wasi",
   arch: "wasm32",
@@ -621,7 +690,66 @@ globalThis.process = process;
 
 // Web Worker globals that napi-rs wasi-worker expects.
 // self is already globalThis in a Web Worker (read-only getter, cannot set).
-try { if (!globalThis.Worker) globalThis.Worker = class Worker {}; } catch {}
+
+// CRITICAL: Disable WASM child thread spawning.
+// WASM thread spawning via wasi-threads has TLS corruption bugs where child
+// threads crash with "current thread handle already set during thread spawn".
+// We disable at THREE levels for reliability:
+// 1. Override Worker constructor (emnapi uses it to create child workers)
+// 2. Intercept WebAssembly.Instance to replace wasi.thread-spawn with a no-op
+// 3. Intercept WebAssembly.instantiate for async path
+
+// Level 1: Disable Worker constructor at ALL levels of the prototype chain
+const __DisabledWorker = class Worker {
+  constructor() { throw new Error('Thread spawning not available in nodepod worker'); }
+};
+// Override on globalThis (own property)
+try { Object.defineProperty(globalThis, 'Worker', { value: __DisabledWorker, writable: true, configurable: true }); } catch {}
+// Override on prototype chain too (DedicatedWorkerGlobalScope.prototype)
+try {
+  let p = Object.getPrototypeOf(globalThis);
+  while (p && p !== Object.prototype) {
+    try { Object.defineProperty(p, 'Worker', { value: __DisabledWorker, writable: true, configurable: true }); } catch {}
+    p = Object.getPrototypeOf(p);
+  }
+} catch {}
+// Direct assignment fallback
+try { globalThis.Worker = __DisabledWorker; } catch {}
+
+// Level 2: Intercept WebAssembly.Instance to neuter thread-spawn import.
+// This is the most reliable layer — even if Worker override is bypassed,
+// the WASM import itself returns -1 (thread creation failed).
+const __OrigWasmInstance = WebAssembly.Instance;
+const __interceptImports = function(imports) {
+  if (imports) {
+    // Let thread-spawn work naturally — emnapi handles child thread
+    // creation via its instance proxy (no-op _initialize for children).
+    // With RAYON_NUM_THREADS=1 visible in WASI environ, rayon creates
+    // only 1 worker thread. The thread may error during cleanup but
+    // the build operation completes before that happens.
+    // Also check for thread_spawn (underscore variant)
+    if (imports.wasi && typeof imports.wasi['thread_spawn'] === 'function') {
+      imports.wasi['thread_spawn'] = function() { return -1; };
+    }
+    // Neuter env.__wasi_thread_spawn if present
+    if (imports.env && typeof imports.env.__wasi_thread_spawn === 'function') {
+      imports.env.__wasi_thread_spawn = function() { return -1; };
+    }
+  }
+};
+WebAssembly.Instance = function(module, imports) {
+  __interceptImports(imports);
+  return new __OrigWasmInstance(module, imports);
+};
+WebAssembly.Instance.prototype = __OrigWasmInstance.prototype;
+
+// Level 3: Intercept WebAssembly.instantiate for async path
+const __origInstantiate = WebAssembly.instantiate;
+WebAssembly.instantiate = function(source, imports) {
+  __interceptImports(imports);
+  return __origInstantiate.call(WebAssembly, source, imports);
+};
+
 try { if (!globalThis.importScripts) globalThis.importScripts = function(f) {}; } catch {};
 
 // parentPort bridge: route Web Worker messages to parentPort listeners
@@ -645,7 +773,7 @@ Object.defineProperty(globalThis, 'onmessage', {
 });
 
 globalThis.postMessage = function(data, transfer) {
-  self.postMessage(data, transfer || []);
+  __nativePostMessage(data, transfer || []);
 };
 
 // Minimal require for node builtins used by wasi-worker scripts
@@ -657,7 +785,7 @@ const __builtinRequire = function(id) {
       isMainThread: false,
       workerData: null,
       threadId: ${_nextWasiThreadId},
-      Worker: globalThis.Worker,
+      Worker: __DisabledWorker,
       MessageChannel: globalThis.MessageChannel || class MessageChannel {
         constructor() { this.port1 = {}; this.port2 = {}; }
       },
@@ -666,6 +794,7 @@ const __builtinRequire = function(id) {
   }
   if (bare === 'path') return __pathStub;
   if (bare === 'fs') return __fsStub;
+  if (bare === 'fs/promises') return __fsStub.promises;
   if (bare === 'os') return __osStub;
   if (bare === 'url') return __urlStub;
   if (bare === 'util') return __utilStub;
@@ -674,7 +803,23 @@ const __builtinRequire = function(id) {
   if (bare === 'buffer') return { Buffer: __BufferStub };
   if (bare === 'string_decoder') return { StringDecoder: class StringDecoder { write(buf) { return new TextDecoder().decode(buf); } end() { return ''; } } };
   if (bare === 'assert') return Object.assign(function assert(v, msg) { if (!v) throw new Error(msg || 'assertion failed'); }, { ok(v,m){if(!v) throw new Error(m);}, strictEqual(a,b,m){if(a!==b) throw new Error(m);}, deepStrictEqual(){} });
-  return {};
+  if (bare === 'module') return { createRequire() { return __builtinRequire; } };
+  if (bare === 'crypto') return {
+    randomBytes(n) { const b = new Uint8Array(n); crypto.getRandomValues(b); return b; },
+    createHash() { return { update() { return this; }, digest() { return ''; } }; },
+    getRandomValues: crypto.getRandomValues.bind(crypto),
+    subtle: crypto.subtle,
+  };
+  if (bare === 'stream') return __eventsStub; // minimal — EventEmitter base
+  if (bare === 'child_process' || bare === 'net' || bare === 'tls' ||
+      bare === 'http' || bare === 'https' || bare === 'http2' ||
+      bare === 'dgram' || bare === 'dns' || bare === 'cluster' ||
+      bare === 'inspector' || bare === 'repl' || bare === 'readline' ||
+      bare === 'tty' || bare === 'v8' || bare === 'vm' ||
+      bare === 'perf_hooks' || bare === 'async_hooks' || bare === 'trace_events') return {};
+  // Return undefined for unknown modules so resolution falls through
+  // to the bundled module search in __require / localRequire
+  return undefined;
 };
 
 // path stub
@@ -706,10 +851,151 @@ const __pathStub = {
 };
 __pathStub.posix = __pathStub;
 
-// fs stub (operations go through __fs__ proxy to main thread)
+// fs proxy — synchronous FS operations forwarded to main thread via SharedArrayBuffer + Atomics.
+// The main thread handles __fs__ messages using the real nodepod VFS (MemoryVolume).
+// Protocol: worker creates a SAB, posts {__fs__: {sab, type, payload}}, then Atomics.wait().
+// Main thread performs the op, writes result to SAB, Atomics.notify().
+// Header layout (Int32Array view, first 16 bytes):
+//   [0] = status: -1 = pending, 0 = success, 1 = error
+//   [1] = result type: 0=undefined, 1=null, 2=bool, 3=number, 4=string, 5=buffer, 6=json, 9=bigint
+//   [2] = payload byte length
+//   [3] = reserved
+const __FS_DEFAULT_SAB = 16 + 65536; // 16 header + 64KB payload (enough for most ops)
+
+function __fsSyncCall(type, args, sabSize) {
+  const size = sabSize || __FS_DEFAULT_SAB;
+  const sab = new SharedArrayBuffer(size);
+  const ctrl = new Int32Array(sab, 0, 4);
+  Atomics.store(ctrl, 0, -1); // pending
+
+  // Post request to main thread (use native postMessage to avoid infinite recursion)
+  __nativePostMessage({ __fs__: { sab: ctrl, type: type, payload: args || [] } });
+
+  // Block until main thread responds
+  const result = Atomics.wait(ctrl, 0, -1, 30000); // 30s timeout
+  if (result === 'timed-out') {
+    throw Object.assign(new Error('fs.' + type + ' timed out (30s)'), { code: 'ETIMEDOUT' });
+  }
+
+  const status = Atomics.load(ctrl, 0);
+  const resultType = Atomics.load(ctrl, 1);
+  const payloadLen = Atomics.load(ctrl, 2);
+
+  // Read payload bytes
+  const maxPayload = size - 16;
+  const payloadBytes = payloadLen > 0 ? new Uint8Array(sab, 16, Math.min(payloadLen, maxPayload)) : null;
+
+  if (status === 1) {
+    // Error
+    let errObj;
+    try { errObj = JSON.parse(new TextDecoder().decode(payloadBytes)); } catch { errObj = { message: 'fs.' + type + ' failed' }; }
+    const err = new Error(errObj.message || 'fs.' + type + ' failed');
+    if (errObj.code) err.code = errObj.code;
+    throw err;
+  }
+
+  // Decode result based on type
+  if (resultType === 0) return undefined;
+  if (resultType === 1) return null;
+  if (resultType === 2) return new TextDecoder().decode(payloadBytes) === '1';
+  if (resultType === 3) return Number(new TextDecoder().decode(payloadBytes));
+  if (resultType === 4) return new TextDecoder().decode(payloadBytes);
+  if (resultType === 5) return new Uint8Array(payloadBytes); // buffer copy
+  if (resultType === 9) return BigInt(new TextDecoder().decode(payloadBytes));
+  // json/object
+  try { return JSON.parse(new TextDecoder().decode(payloadBytes)); } catch { return {}; }
+}
+
+// Get an appropriately-sized SAB for readFileSync — stat the file first to
+// determine how large the response buffer needs to be.
+function __fsReadFileSabSize(p) {
+  try {
+    const stat = __fsSyncCall('statSync', [p]);
+    const fileSize = (stat && stat.size) || 0;
+    // Add margin for encoding overhead + header
+    return Math.max(__FS_DEFAULT_SAB, 16 + fileSize + 1024);
+  } catch {
+    return __FS_DEFAULT_SAB; // fallback
+  }
+}
+
+// Build stat-like object with methods
+function __makeStatObj(raw) {
+  if (!raw || typeof raw !== 'object') return raw;
+  const s = Object.assign({}, raw);
+  // Reconstruct Date objects from timestamps
+  if (s.mtimeMs) s.mtime = new Date(s.mtimeMs);
+  if (s.atimeMs) s.atime = new Date(s.atimeMs);
+  if (s.ctimeMs) s.ctime = new Date(s.ctimeMs);
+  if (s.birthtimeMs) s.birthtime = new Date(s.birthtimeMs);
+  // Add stat methods
+  s.isFile = function() { return !!s._isFile; };
+  s.isDirectory = function() { return !!s._isDir; };
+  s.isBlockDevice = function() { return false; };
+  s.isCharacterDevice = function() { return false; };
+  s.isSymbolicLink = function() { return !!s._isSymlink; };
+  s.isFIFO = function() { return false; };
+  s.isSocket = function() { return false; };
+  return s;
+}
+
 const __fsStub = {
-  readFileSync() { throw new Error('fs.readFileSync not available in WASI worker'); },
-  existsSync() { return false; },
+  readFileSync(p, opts) {
+    const encoding = typeof opts === 'string' ? opts : opts?.encoding;
+    // Dynamically size the SAB based on the file size — needed for large
+    // files like .wasm binaries that can be 15+ MB.
+    const sabSize = __fsReadFileSabSize(p);
+    const result = __fsSyncCall('readFileSync', [p, encoding || null], sabSize);
+    return result;
+  },
+  writeFileSync(p, data, opts) { return __fsSyncCall('writeFileSync', [p, typeof data === 'string' ? data : Array.from(data), opts]); },
+  existsSync(p) { try { __fsSyncCall('statSync', [p]); return true; } catch { return false; } },
+  statSync(p) { return __makeStatObj(__fsSyncCall('statSync', [p])); },
+  lstatSync(p) { return __makeStatObj(__fsSyncCall('lstatSync', [p])); },
+  readdirSync(p, opts) { return __fsSyncCall('readdirSync', [p, opts]) || []; },
+  mkdirSync(p, opts) { return __fsSyncCall('mkdirSync', [p, opts]); },
+  unlinkSync(p) { return __fsSyncCall('unlinkSync', [p]); },
+  rmdirSync(p) { return __fsSyncCall('rmdirSync', [p]); },
+  renameSync(o, n) { return __fsSyncCall('renameSync', [o, n]); },
+  realpathSync(p) { try { return __fsSyncCall('realpathSync', [p]); } catch { return p; } },
+  accessSync(p) { return __fsSyncCall('accessSync', [p]); },
+  openSync(p, flags) {
+    // Return a pseudo fd — actual file content goes through readFileSync
+    try { __fsSyncCall('statSync', [p]); return 3; } catch { const e = new Error('ENOENT: ' + p); e.code = 'ENOENT'; throw e; }
+  },
+  closeSync() { return; },
+  readSync() { return 0; },
+  fstatSync(fd) { return __makeStatObj({ mode: 0o100644, size: 0, _isFile: true }); },
+  createReadStream() { throw new Error('createReadStream not supported in worker'); },
+  createWriteStream() { throw new Error('createWriteStream not supported in worker'); },
+  // Async variants (return promises or take callbacks)
+  readFile(p, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    try { const r = __fsStub.readFileSync(p, opts); if (cb) cb(null, r); } catch(e) { if (cb) cb(e); }
+  },
+  stat(p, cb) { try { const r = __fsStub.statSync(p); if (cb) cb(null, r); } catch(e) { if (cb) cb(e); } },
+  lstat(p, cb) { try { const r = __fsStub.lstatSync(p); if (cb) cb(null, r); } catch(e) { if (cb) cb(e); } },
+  readdir(p, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    try { const r = __fsStub.readdirSync(p, opts); if (cb) cb(null, r); } catch(e) { if (cb) cb(e); }
+  },
+  access(p, mode, cb) {
+    if (typeof mode === 'function') { cb = mode; mode = undefined; }
+    try { __fsStub.accessSync(p); if (cb) cb(null); } catch(e) { if (cb) cb(e); }
+  },
+  // promises namespace
+  promises: {
+    readFile(p, opts) { try { return Promise.resolve(__fsStub.readFileSync(p, opts)); } catch(e) { return Promise.reject(e); } },
+    stat(p) { try { return Promise.resolve(__fsStub.statSync(p)); } catch(e) { return Promise.reject(e); } },
+    lstat(p) { try { return Promise.resolve(__fsStub.lstatSync(p)); } catch(e) { return Promise.reject(e); } },
+    readdir(p, opts) { try { return Promise.resolve(__fsStub.readdirSync(p, opts)); } catch(e) { return Promise.reject(e); } },
+    access(p) { try { __fsStub.accessSync(p); return Promise.resolve(); } catch(e) { return Promise.reject(e); } },
+    writeFile(p, d, opts) { try { __fsStub.writeFileSync(p, d, opts); return Promise.resolve(); } catch(e) { return Promise.reject(e); } },
+    mkdir(p, opts) { try { __fsStub.mkdirSync(p, opts); return Promise.resolve(); } catch(e) { return Promise.reject(e); } },
+    unlink(p) { try { __fsStub.unlinkSync(p); return Promise.resolve(); } catch(e) { return Promise.reject(e); } },
+  },
+  // Constants
+  constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
 };
 
 // os stub
@@ -736,7 +1022,7 @@ const __urlStub = {
     try { return decodeURIComponent(new URL(u).pathname); }
     catch { return u; }
   },
-  pathToFileURL(p) { return new URL('file://' + p); },
+  pathToFileURL(p) { return p.startsWith('file://') ? new URL(p) : new URL('file://' + p); },
 };
 
 // util stub
@@ -795,12 +1081,20 @@ const __BufferStub = {
   byteLength(s, enc) { return new TextEncoder().encode(s).length; },
 };
 
+// WASM child thread initialization is handled by emnapi's instance proxy
+// which provides a no-op _initialize for child threads. No manual guard needed.
+
 // Real WASI preview1 implementation for worker threads.
 // Provides all required syscalls so WASM modules can initialize.
 const __wasiStub = { WASI: class WASI {
   constructor(opts) {
     this._opts = opts || {};
-    this._env = this._opts.env || {};
+    // ALWAYS merge process.env into WASI env so the WASM module sees
+    // RAYON_NUM_THREADS=1 etc. The wasi-worker.mjs may pass env: {} or
+    // omit it entirely — either way we need process.env to be visible.
+    const _procEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
+    const _optsEnv = this._opts.env || {};
+    this._env = { ..._procEnv, ..._optsEnv };
     this._args = this._opts.args || [];
     this._preopens = [];
     this._memory = null;
@@ -818,6 +1112,11 @@ const __wasiStub = { WASI: class WASI {
     this._instance = inst;
     this._memory = inst.exports.memory;
     const _init = inst.exports._initialize;
+    // emnapi's @emnapi/wasi-threads wraps child thread instances in a Proxy
+    // that returns a no-op for _initialize. So calling _init() is safe for both
+    // main thread (real _initialize) and child threads (no-op).
+    // IMPORTANT: Do NOT write guard values to WASM shared memory — it corrupts
+    // the stack/data segment.
     if (typeof _init === 'function') _init();
   }
   start(inst) { this.initialize(inst); return 0; }
@@ -825,6 +1124,27 @@ const __wasiStub = { WASI: class WASI {
   get wasiImport() { return this._buildImports(); }
   _view() { return new DataView(this._memory.buffer); }
   _bytes() { return new Uint8Array(this._memory.buffer); }
+  // Read a string from WASM memory, handling SharedArrayBuffer.
+  // TextDecoder.decode() rejects SharedArrayBuffer-backed views,
+  // so we must copy to a non-shared buffer first.
+  // Resolve a WASI path relative to a directory entry, normalizing . and ..
+  _resolvePath(dirPath, rel) {
+    const base = dirPath || '/';
+    const raw = rel.startsWith('/') ? rel : (base.endsWith('/') ? base + rel : base + '/' + rel);
+    const segs = raw.split('/');
+    const out = [];
+    for (const s of segs) { if (s === '.' || s === '') continue; if (s === '..') { out.pop(); continue; } out.push(s); }
+    return '/' + out.join('/');
+  }
+  _readStr(ptr, len) {
+    const src = new Uint8Array(this._memory.buffer, ptr, len);
+    if (this._memory.buffer instanceof SharedArrayBuffer) {
+      const copy = new Uint8Array(len);
+      copy.set(src);
+      return new TextDecoder().decode(copy);
+    }
+    return new TextDecoder().decode(src);
+  }
   _buildImports() {
     const E = { SUCCESS: 0, BADF: 8, INVAL: 28, NOENT: 44, NOSYS: 52, IO: 29, ISDIR: 31, NOTDIR: 54, NOTEMPTY: 55, ACCES: 2, EXIST: 20 };
     const self = this;
@@ -841,32 +1161,221 @@ const __wasiStub = { WASI: class WASI {
       fd_fdstat_get(fd, buf) { const dv = self._view(); dv.setUint8(buf, fd <= 2 ? 2 : 3); dv.setUint16(buf + 2, 0, true); dv.setBigUint64(buf + 8, BigInt(0), true); dv.setBigUint64(buf + 16, BigInt(0), true); return E.SUCCESS; },
       fd_fdstat_set_flags() { return E.SUCCESS; },
       fd_fdstat_set_rights() { return E.SUCCESS; },
-      fd_write(fd, iovs, iovs_len, nwritten) { const dv = self._view(); const b = self._bytes(); let total = 0; for (let i = 0; i < iovs_len; i++) { const ptr = dv.getUint32(iovs + i * 8, true); const len = dv.getUint32(iovs + i * 8 + 4, true); const chunk = b.slice(ptr, ptr + len); const txt = new TextDecoder().decode(chunk); if (fd === 1) console.log(txt); else if (fd === 2) console.error(txt); total += len; } dv.setUint32(nwritten, total, true); return E.SUCCESS; },
-      fd_read(fd, iovs, iovs_len, nread) { const dv = self._view(); dv.setUint32(nread, 0, true); return E.SUCCESS; },
+      fd_write(fd, iovs, iovs_len, nwritten) {
+        let total = 0;
+        for (let i = 0; i < iovs_len; i++) {
+          // Re-acquire views each iteration (memory.grow() safety)
+          const dv = self._view(); const b = self._bytes();
+          const ptr = dv.getUint32(iovs + i * 8, true);
+          const len = dv.getUint32(iovs + i * 8 + 4, true);
+          if (ptr + len > b.length) break; // bounds check
+          const chunk = b.slice(ptr, ptr + len);
+          const txt = new TextDecoder().decode(chunk);
+          if (fd === 1) console.log(txt); else if (fd === 2) console.error(txt);
+          else {
+            // File fd: append to fd data
+            const entry = self._fds.get(fd);
+            if (entry && entry.data) {
+              const newData = new Uint8Array(entry.data.length + len);
+              newData.set(entry.data);
+              newData.set(chunk, entry.data.length);
+              entry.data = newData;
+            }
+          }
+          total += len;
+        }
+        self._view().setUint32(nwritten, total, true);
+        return E.SUCCESS;
+      },
+      fd_read(fd, iovs, iovs_len, nread) {
+        const entry = self._fds.get(fd);
+        if (!entry || !entry.data) { self._view().setUint32(nread, 0, true); return E.SUCCESS; }
+        let total = 0;
+        for (let i = 0; i < iovs_len; i++) {
+          // Re-acquire views each iteration — WASM memory.grow() can resize
+          // the underlying buffer, invalidating previous TypedArray views.
+          const dv = self._view();
+          const b = self._bytes();
+          const ptr = dv.getUint32(iovs + i * 8, true);
+          const len = dv.getUint32(iovs + i * 8 + 4, true);
+          const avail = Math.min(len, entry.data.length - (entry.offset || 0));
+          if (avail <= 0) break;
+          // Bounds check: don't write beyond WASM memory
+          if (ptr + avail > b.length) break;
+          b.set(entry.data.subarray(entry.offset || 0, (entry.offset || 0) + avail), ptr);
+          entry.offset = (entry.offset || 0) + avail;
+          total += avail;
+        }
+        self._view().setUint32(nread, total, true);
+        return E.SUCCESS;
+      },
       fd_close(fd) { self._fds.delete(fd); return E.SUCCESS; },
-      fd_seek(fd, offset, whence, newoff) { const dv = self._view(); dv.setBigUint64(newoff, BigInt(0), true); return E.SUCCESS; },
-      fd_tell(fd, off) { const dv = self._view(); dv.setBigUint64(off, BigInt(0), true); return E.SUCCESS; },
+      fd_seek(fd, offset, whence, newoff) {
+        const entry = self._fds.get(fd);
+        const dv = self._view();
+        if (!entry) { dv.setBigUint64(newoff, BigInt(0), true); return E.BADF; }
+        const size = entry.data ? entry.data.length : 0;
+        let pos = entry.offset || 0;
+        const off = Number(offset);
+        if (whence === 0) pos = off;       // SEEK_SET
+        else if (whence === 1) pos += off;  // SEEK_CUR
+        else if (whence === 2) pos = size + off; // SEEK_END
+        entry.offset = Math.max(0, pos);
+        dv.setBigUint64(newoff, BigInt(entry.offset), true);
+        return E.SUCCESS;
+      },
+      fd_tell(fd, off) {
+        const dv = self._view();
+        const entry = self._fds.get(fd);
+        dv.setBigUint64(off, BigInt(entry ? (entry.offset || 0) : 0), true);
+        return E.SUCCESS;
+      },
       fd_sync() { return E.SUCCESS; },
       fd_datasync() { return E.SUCCESS; },
       fd_advise() { return E.SUCCESS; },
       fd_allocate() { return E.SUCCESS; },
-      fd_filestat_get(fd, buf) { const dv = self._view(); const now = BigInt(Date.now()) * BigInt(1000000); for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0); dv.setUint8(buf + 16, fd <= 2 ? 2 : 3); dv.setBigUint64(buf + 48, now, true); dv.setBigUint64(buf + 56, now, true); return E.SUCCESS; },
+      fd_filestat_get(fd, buf) {
+        const dv = self._view();
+        const entry = self._fds.get(fd);
+        const now = BigInt(Date.now()) * BigInt(1000000);
+        for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0);
+        if (entry && entry.data) {
+          dv.setUint8(buf + 16, 4); // FILETYPE_REGULAR_FILE
+          dv.setBigUint64(buf + 32, BigInt(entry.data.length), true); // size
+        } else if (entry && entry.kind === 'dir') {
+          dv.setUint8(buf + 16, 3); // FILETYPE_DIRECTORY
+        } else {
+          dv.setUint8(buf + 16, fd <= 2 ? 2 : 4);
+        }
+        dv.setBigUint64(buf + 48, now, true);
+        dv.setBigUint64(buf + 56, now, true);
+        return E.SUCCESS;
+      },
       fd_filestat_set_size() { return E.SUCCESS; },
       fd_filestat_set_times() { return E.SUCCESS; },
       fd_pread() { return E.NOSYS; },
       fd_pwrite() { return E.NOSYS; },
-      fd_readdir(fd, buf, buf_len, cookie, used) { const dv = self._view(); dv.setUint32(used, 0, true); return E.SUCCESS; },
+      fd_readdir(fd, buf, buf_len, cookie, used) {
+        const dv = self._view(); const b = self._bytes();
+        const entry = self._fds.get(fd);
+        if (!entry || !entry.path) { dv.setUint32(used, 0, true); return E.SUCCESS; }
+        try {
+          const names = __fsStub.readdirSync(entry.path);
+          let offset = 0;
+          const cookieNum = Number(cookie);
+          for (let i = cookieNum; i < names.length && offset + 24 < buf_len; i++) {
+            const name = enc.encode(names[i]);
+            const recLen = 24 + name.length;
+            if (offset + recLen > buf_len) break;
+            dv.setBigUint64(buf + offset, BigInt(i + 1), true); // d_next
+            dv.setBigUint64(buf + offset + 8, BigInt(0), true); // d_ino
+            dv.setUint32(buf + offset + 16, name.length, true); // d_namlen
+            dv.setUint8(buf + offset + 20, 4); // d_type = regular file (best guess)
+            b.set(name, buf + offset + 24);
+            offset += recLen;
+          }
+          dv.setUint32(used, offset, true);
+        } catch { dv.setUint32(used, 0, true); }
+        return E.SUCCESS;
+      },
       fd_renumber() { return E.NOSYS; },
-      path_create_directory() { return E.NOSYS; },
-      path_filestat_get(fd, flags, path_ptr, path_len, buf) { const dv = self._view(); const now = BigInt(Date.now()) * BigInt(1000000); for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0); dv.setUint8(buf + 16, 3); dv.setBigUint64(buf + 48, now, true); dv.setBigUint64(buf + 56, now, true); return E.SUCCESS; },
+      path_create_directory(fd, path_ptr, path_len) {
+        const dirEntry = self._fds.get(fd);
+        if (!dirEntry) return E.BADF;
+        const rel = self._readStr(path_ptr, path_len);
+        const full = self._resolvePath(dirEntry.path, rel);
+        try { __fsStub.mkdirSync(full, { recursive: true }); return E.SUCCESS; } catch { return E.IO; }
+      },
+      path_filestat_get(fd, flags, path_ptr, path_len, buf) {
+        const dv = self._view();
+        const dirEntry = self._fds.get(fd);
+        if (!dirEntry) return E.BADF;
+        const rel = self._readStr(path_ptr, path_len);
+        const full = self._resolvePath(dirEntry.path, rel);
+        try {
+          const stat = __fsStub.statSync(full);
+          const now = BigInt(Date.now()) * BigInt(1000000);
+          for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0);
+          dv.setUint8(buf + 16, stat.isDirectory() ? 3 : 4);
+          dv.setBigUint64(buf + 32, BigInt(stat.size || 0), true);
+          dv.setBigUint64(buf + 48, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
+          dv.setBigUint64(buf + 56, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
+          return E.SUCCESS;
+        } catch {
+          return E.NOENT;
+        }
+      },
       path_filestat_set_times() { return E.SUCCESS; },
       path_link() { return E.NOSYS; },
-      path_open(fd, dirflags, path_ptr, path_len, oflags, fs_rights_base, fs_rights_inheriting, fdflags, fd_out) { const dv = self._view(); const newFd = self._nextFd++; self._fds.set(newFd, { kind: 'file' }); dv.setUint32(fd_out, newFd, true); return E.SUCCESS; },
+      path_open(fd, dirflags, path_ptr, path_len, oflags, fs_rights_base, fs_rights_inheriting, fdflags, fd_out) {
+        const dv = self._view();
+        const dirEntry = self._fds.get(fd);
+        if (!dirEntry) return E.BADF;
+        const rel = self._readStr(path_ptr, path_len);
+        const full = self._resolvePath(dirEntry.path, rel);
+        const wantDir = (oflags & 0x0002) !== 0;
+        const wantCreate = (oflags & 0x0001) !== 0;
+        const wantTrunc = (oflags & 0x0008) !== 0;
+        let exists;
+        try { exists = __fsStub.existsSync(full); } catch { exists = false; }
+        if (wantDir) {
+          if (!exists && !wantCreate) return E.NOENT;
+          if (!exists) try { __fsStub.mkdirSync(full, { recursive: true }); } catch {}
+          const newFd = self._nextFd++;
+          self._fds.set(newFd, { kind: 'dir', path: full });
+          dv.setUint32(fd_out, newFd, true);
+          return E.SUCCESS;
+        }
+        // Regular file
+        if (!exists && !wantCreate) return E.NOENT;
+        let data;
+        try {
+          if (exists && !wantTrunc) {
+            const raw = __fsStub.readFileSync(full);
+            // MUST copy — raw may be a view into a SharedArrayBuffer from the fs proxy.
+            // new Uint8Array(sharedView) creates another VIEW, not a copy!
+            if (raw instanceof Uint8Array) {
+              data = new Uint8Array(raw.length);
+              data.set(raw);
+            } else {
+              data = new TextEncoder().encode(String(raw));
+            }
+          } else {
+            data = new Uint8Array(0);
+            if (!exists && wantCreate) try { __fsStub.writeFileSync(full, data); } catch {}
+          }
+        } catch { return E.NOENT; }
+        const newFd = self._nextFd++;
+        self._fds.set(newFd, { kind: 'file', path: full, data: data, offset: 0 });
+        dv.setUint32(fd_out, newFd, true);
+        return E.SUCCESS;
+      },
       path_readlink() { return E.NOSYS; },
-      path_remove_directory() { return E.NOSYS; },
-      path_rename() { return E.NOSYS; },
+      path_remove_directory(fd, path_ptr, path_len) {
+        const dirEntry = self._fds.get(fd);
+        if (!dirEntry) return E.BADF;
+        const rel = self._readStr(path_ptr, path_len);
+        const full = self._resolvePath(dirEntry.path, rel);
+        try { __fsStub.rmdirSync(full); return E.SUCCESS; } catch { return E.IO; }
+      },
+      path_rename(fd, old_ptr, old_len, new_fd, new_ptr, new_len) {
+        const dirEntry = self._fds.get(fd);
+        const newDirEntry = self._fds.get(new_fd);
+        if (!dirEntry || !newDirEntry) return E.BADF;
+        const oldRel = self._readStr(old_ptr, old_len);
+        const newRel = self._readStr(new_ptr, new_len);
+        const oldFull = self._resolvePath(dirEntry.path, oldRel);
+        const newFull = self._resolvePath(newDirEntry.path, newRel);
+        try { __fsStub.renameSync(oldFull, newFull); return E.SUCCESS; } catch { return E.IO; }
+      },
       path_symlink() { return E.NOSYS; },
-      path_unlink_file() { return E.NOSYS; },
+      path_unlink_file(fd, path_ptr, path_len) {
+        const dirEntry = self._fds.get(fd);
+        if (!dirEntry) return E.BADF;
+        const rel = self._readStr(path_ptr, path_len);
+        const full = self._resolvePath(dirEntry.path, rel);
+        try { __fsStub.unlinkSync(full); return E.SUCCESS; } catch { return E.IO; }
+      },
       poll_oneoff(in_ptr, out_ptr, nsubs, nevents_out) { const dv = self._view(); let n = 0; for (let i = 0; i < nsubs; i++) { const sp = in_ptr + i * 48; const ep = out_ptr + n * 32; const ud = dv.getBigUint64(sp, true); const ty = dv.getUint8(sp + 8); dv.setBigUint64(ep, ud, true); dv.setUint16(ep + 8, 0, true); dv.setUint8(ep + 10, ty); n++; } dv.setUint32(nevents_out, n, true); return E.SUCCESS; },
       proc_exit(code) { throw new Error('proc_exit(' + code + ')'); },
       proc_raise() { return E.NOSYS; },
@@ -911,6 +1420,13 @@ function __requireInner(idOrPath) {
     if (__moduleCache[idOrPath]) return __moduleCache[idOrPath].exports;
     const mod = __modules[idOrPath];
     if (!mod) throw new Error('Module not found: ' + idOrPath);
+    // Lazily compile the module function from its source string.
+    // This defers V8 parsing to first-require time, preventing parser
+    // stack overflow that occurs when all modules are parsed at once.
+    if (!mod.fn && mod.src !== undefined) {
+      mod.fn = new Function('module', 'exports', 'require', '__filename', '__dirname', mod.src);
+    }
+    if (!mod.fn) throw new Error('Module has no source: ' + idOrPath);
     const m = { exports: {}, id: mod.path, filename: mod.path, loaded: false };
     __moduleCache[idOrPath] = m;
     const localRequire = function(dep) {
@@ -952,8 +1468,16 @@ function __requireInner(idOrPath) {
   // String path → lookup in pathToId
   const id = __pathToId[idOrPath];
   if (id !== undefined) return __require(id);
+  // Bare specifier search (same as localRequire does)
+  for (const [p, pid] of Object.entries(__pathToId)) {
+    if (p.includes('/node_modules/' + idOrPath + '/') || p.endsWith('/node_modules/' + idOrPath)) {
+      return __require(pid);
+    }
+  }
   // Try builtin
-  return __builtinRequire(idOrPath) || {};
+  const builtin = __builtinRequire(idOrPath);
+  if (builtin !== undefined) return builtin;
+  return {};
 }
 
 function __resolvePath(base, rel) {

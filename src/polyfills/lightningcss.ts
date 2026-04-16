@@ -1,10 +1,11 @@
-// Lazy-loads lightningcss-wasm from CDN since native .node binaries can't run in browser.
-// Feature flags are inlined for synchronous access; actual transform/bundle delegates to WASM.
+// Last-resort CDN polyfill for lightningcss when neither the native .node binary
+// nor the lightningcss-wasm npm package can load. Uses esm.sh CDN.
+// The primary path is the lightningcss-wasm npm package with VFS→CDN fallback
+// for the large .wasm binary (see fetch patch in ScriptEngine).
 
 import { CDN_LIGHTNINGCSS_WASM, cdnImport } from "../constants/cdn-urls";
 
 // Bitfield constants -- must be available synchronously before WASM loads
-
 export const Features = {
   Nesting:                        1,
   NotSelectorList:                2,
@@ -58,21 +59,27 @@ async function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-// start eagerly so WASM is ready by the time transform() is called
-ensureInit();
+// Start eagerly in browser environments so WASM is ready by the time transform() is called.
+if (typeof window !== "undefined" || typeof (globalThis as any).importScripts === "function") {
+  ensureInit().catch(() => {}); // swallow — functions will retry on call
+}
+
+function requireInit(): void {
+  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet — call await init() first");
+}
 
 export function transform(opts: any): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet — call await init() first");
+  requireInit();
   return wasmMod.transform(opts);
 }
 
 export function transformStyleAttribute(opts: any): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet");
+  requireInit();
   return wasmMod.transformStyleAttribute(opts);
 }
 
 export function bundle(opts: any): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet");
+  requireInit();
   return wasmMod.bundle(opts);
 }
 
@@ -82,7 +89,7 @@ export async function bundleAsync(opts: any): Promise<any> {
 }
 
 export function composeVisitors(visitors: any[]): any {
-  if (!wasmMod) throw new Error("lightningcss: WASM not ready yet");
+  requireInit();
   return wasmMod.composeVisitors(visitors);
 }
 

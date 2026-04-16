@@ -1316,7 +1316,7 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
     if (exportedMemory) {
       memory = exportedMemory;
     }
-    console.log(`[WASI] initialize: memory=${memory ? 'set' : 'null'}, exports.memory=${exportedMemory ? 'yes' : 'no'}, _initialize=${typeof wasmInstance?.exports?._initialize}`);
+    // Debug logging removed (was: [WASI] initialize: memory/exports info)
 
     const _initialize = wasmInstance?.exports?._initialize;
     if (typeof _initialize === "function") {

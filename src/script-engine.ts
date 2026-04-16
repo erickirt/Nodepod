@@ -1045,6 +1045,19 @@ const CORE_MODULES: Record<string, unknown> = {
   },
 };
 
+// ── Native package polyfill fallbacks ──
+// When a native npm package (with platform-specific .node bindings) fails to
+// load AND no WASM npm alternative works, these CDN-based polyfills are used
+// as a last resort. This is purely a fallback — installed WASM npm packages
+// take priority. Entries here are loaded on-demand, not eagerly.
+const NATIVE_PACKAGE_POLYFILLS: Record<string, unknown> = {
+  // lightningcss: CDN-based WASM polyfill as last resort.
+  // The generic WASM fallback (lightningcss-wasm npm package) is tried first,
+  // but its 15.9MB .wasm binary often fails to extract via the worker pipeline.
+  // This CDN polyfill loads lightningcss-wasm directly from CDN on first use.
+  lightningcss: lightningcssPolyfill,
+};
+
 // ── Console wrapper ──
 // Captured at module load time to avoid infinite recursion when globalThis.console is overridden
 const _nativeConsole = console;
@@ -2916,12 +2929,25 @@ function buildResolver(
           try {
             resolveCache.delete(`${baseDir}|${alt}`);
             const altResolved = resolveId(alt, baseDir);
-            console.log(`[WASM-fallback] ${id} → ${alt} resolved to ${altResolved}`);
             const altRec = loadModule(altResolved, resolver._ownerRecord);
             return altRec.exports;
           } catch (altErr: any) {
-            console.log(`[WASM-fallback] ${id} → ${alt} failed: ${altErr?.message?.slice(0, 120)}`);
+            // Log WASM alternative errors so they're not silently swallowed
+            if (altErr?.code !== "MODULE_NOT_FOUND") {
+              _nativeConsole.warn(`[wasm-fallback] ${alt}:`, altErr?.message?.slice(0, 200));
+            }
           }
+        }
+        // Last resort: check if there's a built-in CDN-based polyfill
+        // for this package (e.g. lightningcss → CDN WASM build).
+        // If the polyfill has an async init(), use syncAwait to block until
+        // WASM is ready, so synchronous APIs (transform, etc.) work immediately.
+        const polyfillFallback = NATIVE_PACKAGE_POLYFILLS[id] as any;
+        if (polyfillFallback) {
+          if (typeof polyfillFallback.init === "function") {
+            try { syncAwait(polyfillFallback.init()); } catch { /* best effort */ }
+          }
+          return polyfillFallback;
         }
       }
       throw loadErr;
@@ -3100,6 +3126,35 @@ export class ScriptEngine {
                 ),
               );
             } catch {
+              // For .wasm files inside node_modules that aren't in VFS
+              // (e.g. large binaries that failed during extraction),
+              // transparently fetch from CDN. This is generic — works for
+              // any npm package with large .wasm files.
+              if (vfsPath.endsWith(".wasm") && vfsPath.includes("/node_modules/")) {
+                const nmIdx = vfsPath.lastIndexOf("/node_modules/");
+                const afterNm = vfsPath.substring(nmIdx + "/node_modules/".length);
+                // afterNm = "lightningcss-wasm/lightningcss_node.wasm"
+                // or "@scope/pkg/file.wasm"
+                const parts = afterNm.split("/");
+                let pkgName: string;
+                let filePath: string;
+                if (parts[0].startsWith("@")) {
+                  pkgName = parts[0] + "/" + parts[1];
+                  filePath = parts.slice(2).join("/");
+                } else {
+                  pkgName = parts[0];
+                  filePath = parts.slice(1).join("/");
+                }
+                // Try to read version from the package's package.json in VFS
+                let version = "latest";
+                try {
+                  const pkgJsonPath = vfsPath.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
+                  const pkgJson = JSON.parse(v.readFileSync(pkgJsonPath, "utf8"));
+                  if (pkgJson.version) version = pkgJson.version;
+                } catch { /* use latest */ }
+                const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
+                return origFetch(cdnUrl);
+              }
               return Promise.resolve(
                 new Response("Not found", { status: 404 }),
               );
@@ -3111,6 +3166,38 @@ export class ScriptEngine {
       (globalThis as any).fetch = Object.assign(patchedFetch, {
         __nodepodPatched: true,
       });
+    }
+
+    // Patch URL constructor: bundlers (rolldown, rollup, vite) use null-byte
+    // prefixed paths (\0module, %00module) for virtual/in-memory modules.
+    // Chrome's URL constructor rejects null bytes. We sanitize them to valid
+    // characters while preserving the virtual module semantics.
+    if (!(globalThis.URL as any).__nodepodPatched) {
+      const OrigURL = globalThis.URL;
+      const PatchedURL = function URL(this: any, url: string, base?: string) {
+        try {
+          if (base !== undefined) return new OrigURL(url, base);
+          return new OrigURL(url);
+        } catch (e: any) {
+          // Sanitize null bytes in virtual module URLs
+          if (typeof url === "string" && (url.includes("%00") || url.includes("\0"))) {
+            const sanitized = url
+              .replace(/%00/g, "__v_nul__")
+              .replace(/\0/g, "__v_nul__")
+              // Ensure file:// has three slashes for absolute paths
+              .replace(/^file:\/\/([^/])/, "file:///$1");
+            if (base !== undefined) return new OrigURL(sanitized, base);
+            return new OrigURL(sanitized);
+          }
+          throw e;
+        }
+      } as any;
+      PatchedURL.prototype = OrigURL.prototype;
+      PatchedURL.createObjectURL = OrigURL.createObjectURL?.bind(OrigURL);
+      PatchedURL.revokeObjectURL = OrigURL.revokeObjectURL?.bind(OrigURL);
+      PatchedURL.canParse = (OrigURL as any).canParse?.bind(OrigURL);
+      (PatchedURL as any).__nodepodPatched = true;
+      (globalThis as any).URL = PatchedURL;
     }
 
     if (typeof globalThis.setImmediate === "undefined") {

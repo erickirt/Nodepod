@@ -1330,9 +1330,55 @@ export function buildFileSystemBridge(
       if (enc === "utf8" || enc === "utf-8") {
         return volume.readFileSync(p, "utf8");
       }
-      const raw = volume.readFileSync(p);
-      if (p.endsWith(".wasm")) precompileWasm(raw);
-      return wrapAsBuffer(raw);
+      try {
+        const raw = volume.readFileSync(p);
+        if (p.endsWith(".wasm")) precompileWasm(raw);
+        return wrapAsBuffer(raw);
+      } catch (err: any) {
+        // For .wasm files inside node_modules that failed to extract (e.g. >15MB),
+        // transparently fetch from CDN via synchronous XHR. The script engine's
+        // async WASM compilation mechanism handles the >4MB compile limit.
+        if (
+          err?.code === "ENOENT" &&
+          p.endsWith(".wasm") &&
+          p.includes("/node_modules/") &&
+          typeof XMLHttpRequest !== "undefined"
+        ) {
+          const nmIdx = p.lastIndexOf("/node_modules/");
+          const afterNm = p.substring(nmIdx + "/node_modules/".length);
+          const parts = afterNm.split("/");
+          let pkgName: string;
+          let filePath: string;
+          if (parts[0].startsWith("@")) {
+            pkgName = parts[0] + "/" + parts[1];
+            filePath = parts.slice(2).join("/");
+          } else {
+            pkgName = parts[0];
+            filePath = parts.slice(1).join("/");
+          }
+          let version = "latest";
+          try {
+            const pkgJsonPath = p.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
+            const pkgJson = JSON.parse(volume.readFileSync(pkgJsonPath, "utf8"));
+            if (pkgJson.version) version = pkgJson.version;
+          } catch { /* use latest */ }
+          const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
+          try {
+            const xhr = new XMLHttpRequest();
+            xhr.open("GET", cdnUrl, false); // synchronous
+            xhr.responseType = "arraybuffer";
+            xhr.send();
+            if (xhr.status === 200 && xhr.response) {
+              const bytes = new Uint8Array(xhr.response as ArrayBuffer);
+              // Cache in VFS for future reads
+              volume.writeFileSync(p, bytes);
+              precompileWasm(bytes);
+              return wrapAsBuffer(bytes);
+            }
+          } catch { /* CDN fallback failed, throw original error */ }
+        }
+        throw err;
+      }
     },
 
     writeFileSync(target: unknown, data: string | Uint8Array): void {
