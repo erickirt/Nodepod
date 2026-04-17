@@ -1,5 +1,5 @@
 // worker_threads polyfill using fork infrastructure for real Web Workers
-// Enhanced with generic napi-rs WASI worker support
+// enhanced with generic napi-rs WASI worker support
 
 
 import { EventEmitter } from "./events";
@@ -39,11 +39,7 @@ export function setWorkerThreadForkCallback(fn: WorkerThreadForkFn): void {
   _workerThreadForkFn = fn;
 }
 
-/**
- * Override the Worker constructor with a custom factory.
- * Used by the script-engine to inject PatchedWorker that supports napi-rs WASI workers.
- * The factory receives the same (script, opts) args as the Worker constructor.
- */
+// script-engine injects a PatchedWorker factory here for napi-rs WASI worker support, factory gets (script, opts) like the constructor
 let _workerConstructorOverride: ((self: any, script: string | URL, opts?: any) => void) | null = null;
 
 export function setWorkerConstructorOverride(fn: ((self: any, script: string | URL, opts?: any) => void) | null): void {
@@ -163,9 +159,7 @@ export const Worker = function Worker(
   this._terminated = false;
   this._isReffed = false;
 
-  // If a constructor override is installed (e.g. napi-rs WASI worker factory),
-  // delegate to it. It handles both WASI workers (real Web Workers) and
-  // standard workers (fallback to fork-based).
+  // if override is installed (napi-rs WASI worker factory), delegate — it handles both WASI workers and fork-based fallback
   if (_workerConstructorOverride) {
     _workerConstructorOverride(this, script, opts);
     return;
@@ -276,27 +270,20 @@ Worker.prototype.getHeapSnapshot = function getHeapSnapshot(): Promise<unknown> 
   return Promise.resolve({});
 };
 
-// Support direct onmessage/onerror/onexit setters — napi-rs .wasi.cjs loaders
-// use `worker.onmessage = ({data}) => ...` instead of `.on('message', ...)`.
-// onmessage wraps the value in {data} to match the Web Worker MessageEvent shape,
-// since napi-rs expects `({data}) => ...` destructuring.
+// direct onmessage/onerror/onexit setters, napi-rs .wasi.cjs loaders use worker.onmessage = ... instead of .on('message', ...)
+//
+// CRITICAL: the onmessage setter must NOT add an EventEmitter listener
+// emnapi (ENVIRONMENT_IS_NODE=true) already calls worker.on('message', data => worker.onmessage?.({data}))
+// if this setter ALSO added a listener, each message would fire twice — for 'spawn-thread' that means
+// duplicate workers calling wasi_thread_start with the same startArg → TLS corruption / "current thread handle already set"
+// fix: setter just stores the handler, emnapi's explicit on('message') dispatches exactly once
 {
   const _onmessageSym = Symbol("onmessage");
-  const _onmessageWrapperSym = Symbol("onmessageWrapper");
   Object.defineProperty(Worker.prototype, "onmessage", {
     get() { return this[_onmessageSym] ?? null; },
     set(fn: Function | null) {
-      // Remove previous wrapper
-      if (this[_onmessageWrapperSym]) this.off("message", this[_onmessageWrapperSym]);
       this[_onmessageSym] = fn;
-      if (fn) {
-        // Wrap: emit {data} like Web Worker MessageEvent
-        const wrapper = (val: unknown) => fn({ data: val });
-        this[_onmessageWrapperSym] = wrapper;
-        this.on("message", wrapper);
-      } else {
-        this[_onmessageWrapperSym] = null;
-      }
+      // do NOT add as EventEmitter listener, emnapi's worker.on('message') already calls worker.onmessage()
     },
     configurable: true,
   });
@@ -305,9 +292,8 @@ Worker.prototype.getHeapSnapshot = function getHeapSnapshot(): Promise<unknown> 
   Object.defineProperty(Worker.prototype, "onerror", {
     get() { return this[_onerrorSym] ?? null; },
     set(fn: Function | null) {
-      if (this[_onerrorSym]) this.off("error", this[_onerrorSym]);
       this[_onerrorSym] = fn;
-      if (fn) this.on("error", fn);
+      // same as onmessage, do NOT add as EventEmitter listener
     },
     configurable: true,
   });

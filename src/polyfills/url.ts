@@ -145,7 +145,7 @@ export function fileURLToPath(input: string | URL): string {
 }
 
 export function pathToFileURL(fsPath: string): URL {
-  // Already a file:// URL? Return as-is (don't double-prefix)
+  // already a file:// URL, don't double-prefix
   if (fsPath.startsWith("file://")) {
     return new globalThis.URL(fsPath);
   }

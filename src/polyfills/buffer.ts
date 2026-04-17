@@ -67,8 +67,7 @@ class BufferPolyfill extends Uint8Array {
     }
 
     if (source instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer)) {
-      // Support Buffer.from(arrayBuffer, byteOffset, length) — used by napi-rs
-      // to create views into WebAssembly.Memory.buffer (SharedArrayBuffer)
+      // napi-rs uses Buffer.from(arrayBuffer, byteOffset, length) to view WebAssembly.Memory.buffer
       if (typeof encOrMapper === 'number') {
         const offset = encOrMapper;
         const length = ctx as number | undefined;
@@ -144,6 +143,12 @@ class BufferPolyfill extends Uint8Array {
 
     if (lower === 'latin1' || lower === 'binary') return bytesToLatin1(this);
 
+    // copy into fresh buffer, TextDecoder.decode() rejects SharedArrayBuffer views (napi-rs/WASI over shared memory)
+    if (typeof SharedArrayBuffer !== "undefined" && this.buffer instanceof SharedArrayBuffer) {
+      const copy = new Uint8Array(this.byteLength);
+      copy.set(this);
+      return textDec.decode(copy);
+    }
     return textDec.decode(this);
   }
 

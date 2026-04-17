@@ -1,7 +1,5 @@
-// Last-resort CDN polyfill for lightningcss when neither the native .node binary
-// nor the lightningcss-wasm npm package can load. Uses esm.sh CDN.
-// The primary path is the lightningcss-wasm npm package with VFS→CDN fallback
-// for the large .wasm binary (see fetch patch in ScriptEngine).
+// last-resort CDN polyfill via esm.sh, used when both the native .node binary and the lightningcss-wasm npm package fail to load
+// primary path is the npm package with VFS-to-CDN fallback for the large .wasm (see fetch patch in ScriptEngine)
 
 import { CDN_LIGHTNINGCSS_WASM, cdnImport } from "../constants/cdn-urls";
 
@@ -59,9 +57,9 @@ async function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-// Start eagerly in browser environments so WASM is ready by the time transform() is called.
+// start eagerly in browsers so WASM is ready by the time transform() is called
 if (typeof window !== "undefined" || typeof (globalThis as any).importScripts === "function") {
-  ensureInit().catch(() => {}); // swallow — functions will retry on call
+  ensureInit().catch(() => {}); // swallow, functions retry on call
 }
 
 function requireInit(): void {

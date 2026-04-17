@@ -1335,9 +1335,7 @@ export function buildFileSystemBridge(
         if (p.endsWith(".wasm")) precompileWasm(raw);
         return wrapAsBuffer(raw);
       } catch (err: any) {
-        // For .wasm files inside node_modules that failed to extract (e.g. >15MB),
-        // transparently fetch from CDN via synchronous XHR. The script engine's
-        // async WASM compilation mechanism handles the >4MB compile limit.
+        // fall back to CDN for .wasm in node_modules that failed to extract (e.g. >15MB), script engine handles >4MB async compile
         if (
           err?.code === "ENOENT" &&
           p.endsWith(".wasm") &&
@@ -1370,18 +1368,36 @@ export function buildFileSystemBridge(
             xhr.send();
             if (xhr.status === 200 && xhr.response) {
               const bytes = new Uint8Array(xhr.response as ArrayBuffer);
-              // Cache in VFS for future reads
+              // cache in VFS so subsequent reads hit it
               volume.writeFileSync(p, bytes);
               precompileWasm(bytes);
               return wrapAsBuffer(bytes);
             }
-          } catch { /* CDN fallback failed, throw original error */ }
+          } catch { /* CDN fallback failed, rethrow original */ }
         }
         throw err;
       }
     },
 
-    writeFileSync(target: unknown, data: string | Uint8Array): void {
+    writeFileSync(target: unknown, data: string | Uint8Array | ArrayBuffer | ArrayBufferView | unknown): void {
+      // normalize binary once, napi-rs WASM packages pass ArrayBuffer/TypedArray/Buffer/plain arrays (postMessage via Array.from)
+      // otherwise precompileWasm throws and the volume stores non-Uint8Array content
+      let normalized: string | Uint8Array;
+      if (typeof data === "string") {
+        normalized = data;
+      } else if (data instanceof Uint8Array) {
+        normalized = data;
+      } else if (data instanceof ArrayBuffer) {
+        normalized = new Uint8Array(data);
+      } else if (data && ArrayBuffer.isView(data as any)) {
+        const view = data as ArrayBufferView;
+        normalized = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      } else if (Array.isArray(data) || (data && typeof (data as any).length === "number")) {
+        normalized = Uint8Array.from(data as ArrayLike<number>);
+      } else {
+        normalized = new Uint8Array(0);
+      }
+
       if (typeof target === "number") {
         const entry = openFiles.get(target);
         if (!entry) {
@@ -1392,15 +1408,15 @@ export function buildFileSystemBridge(
           err.errno = -9;
           throw err;
         }
-        const bytes = typeof data === "string" ? encoder.encode(data) : data;
+        const bytes = typeof normalized === "string" ? encoder.encode(normalized) : normalized;
         entry.data = new Uint8Array(bytes);
         entry.cursor = bytes.length;
         return;
       }
       const wp = abs(target);
-      volume.writeFileSync(wp, data);
-      if (wp.endsWith(".wasm") && typeof data !== "string") {
-        precompileWasm(data);
+      volume.writeFileSync(wp, normalized);
+      if (wp.endsWith(".wasm") && typeof normalized !== "string") {
+        precompileWasm(normalized);
       }
     },
 

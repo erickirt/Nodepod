@@ -408,7 +408,7 @@ function locateModule(
     }
   }
   searchRoots.push("/node_modules/" + pkgName);
-  // Also search from cwd — handles projects not at /project/ (e.g. /home/test/)
+  // also walk from cwd, handles projects outside /project/ (e.g. /home/test/)
   const cwd = typeof process !== 'undefined' && process.cwd ? process.cwd() : '/';
   if (cwd !== '/' && cwd !== fromDir) {
     let d = cwd;
@@ -698,7 +698,7 @@ function createVolumePlugin(externals?: string[], platform?: string, conditions?
               }
             }
             candidates.push("/node_modules/" + pkgName);
-            // Also search from cwd for projects not at /project/
+            // also walk from cwd, for projects outside /project/
             const cwd2 = typeof process !== 'undefined' && process.cwd ? process.cwd() : '/';
             if (cwd2 !== '/') {
               let d2 = cwd2;

@@ -1,34 +1,26 @@
 /**
- * napi-wasm-worker.ts
+ * generic support for napi-rs WASM packages in nodepod
  *
- * Generic support for napi-rs WASM packages in nodepod.
+ * every napi-rs v3 WASM package (targeting wasm32-wasip1-threads) ships a
+ * wasi-worker.mjs that needs a real Web Worker so Atomics.wait() can block
  *
- * Every napi-rs v3 WASM package (targeting wasm32-wasip1-threads) generates
- * a `wasi-worker.mjs` script that needs to run in a real Web Worker to support
- * Atomics.wait() blocking. This module provides:
+ * we:
+ * 1. detect napi-rs WASI worker scripts
+ * 2. bundle them + deps into self-contained blobs
+ * 3. spawn real Web Workers wrapping the Node.js worker_threads API
  *
- * 1. Detection of napi-rs WASI worker scripts
- * 2. Bundling of worker scripts + dependencies into self-contained blobs
- * 3. Creation of real Web Workers wrapping the Node.js worker_threads API
- *
- * This is GENERIC — no hardcoding for specific packages.
+ * no hardcoding per package
  */
 
 import type { MemoryVolume } from "../memory-volume";
 import { EventEmitter } from "../polyfills/events";
 import { ref as eventLoopRef, unref as eventLoopUnref } from "./event-loop";
 
-// ────────────────────────────────────────────────────────────────────────────
-// Detection: is a given script path a napi-rs WASI worker?
-// ────────────────────────────────────────────────────────────────────────────
-
 /**
- * Returns true if `scriptPath` is a wasi-worker script inside a node_modules
- * package that also contains a .wasm file (i.e., it's an napi-rs WASM package).
+ * true if scriptPath is a wasi-worker script in a node_modules package that
+ * also has a .wasm file next to it (i.e. an napi-rs WASM package)
  *
- * Checks for the standard napi-rs generated filenames:
- * - wasi-worker.mjs
- * - wasi-worker-browser.mjs
+ * napi-rs generates these names: wasi-worker.mjs and wasi-worker-browser.mjs
  */
 export function isNapiWasiWorkerScript(
   scriptPath: string,
@@ -38,7 +30,7 @@ export function isNapiWasiWorkerScript(
   if (base !== "wasi-worker.mjs" && base !== "wasi-worker-browser.mjs") {
     return false;
   }
-  // Check that the containing directory has a .wasm file
+  // containing dir must have a .wasm file
   const dir = scriptPath.substring(0, scriptPath.lastIndexOf("/"));
   try {
     const entries = vol.readdirSync(dir);
@@ -50,13 +42,9 @@ export function isNapiWasiWorkerScript(
   }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Bundle builder: collects a VFS entry point + all its deps into one script
-// ────────────────────────────────────────────────────────────────────────────
-
 /**
- * Builds a self-contained Web Worker script from a VFS entry point.
- * Recursively resolves imports/requires and bundles everything inline.
+ * builds a self-contained Web Worker script from a VFS entry point
+ * recursively resolves imports/requires and inlines everything
  */
 export function buildNapiWorkerBundle(
   entryPath: string,
@@ -64,12 +52,11 @@ export function buildNapiWorkerBundle(
   resolveModule: (id: string, fromDir: string) => string,
   processEnv: Record<string, string>,
 ): string {
-  const modules = new Map<string, string>(); // resolvedPath → source code
-  const moduleIds = new Map<string, number>(); // resolvedPath → numeric id
+  const modules = new Map<string, string>(); // resolvedPath -> source
+  const moduleIds = new Map<string, number>(); // resolvedPath -> numeric id
   let nextId = 0;
   const visited = new Set<string>();
 
-  // Recursive dependency collector
   function collectDeps(filePath: string): void {
     if (visited.has(filePath)) return;
     visited.add(filePath);
@@ -87,7 +74,7 @@ export function buildNapiWorkerBundle(
     moduleIds.set(filePath, id);
     modules.set(filePath, source);
 
-    // Extract import/require targets (simplified but sufficient for napi-rs deps)
+    // simplified regex, good enough for napi-rs deps
     const importRe =
       /(?:import\s+.*?\s+from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\)|export\s+.*?\s+from\s+['"]([^'"]+)['"])/g;
     let match: RegExpExecArray | null;
@@ -97,57 +84,50 @@ export function buildNapiWorkerBundle(
       const dep = match[1] || match[2] || match[3];
       if (!dep) continue;
 
-      // Skip Node.js builtins — they'll be provided as stubs
+      // Node.js builtins get stubs instead
       if (isBuiltin(dep)) continue;
 
-      // Resolve the dependency
       try {
         const resolved = resolveModule(dep, fromDir);
         if (resolved && !isBuiltin(resolved)) {
-          // Skip .min.js files — they have deeply nested expressions that can
-          // overflow Chrome's parser when embedded in a blob Worker script.
-          // The non-minified .cjs.js versions are functionally identical.
+          // skip .min.js, deeply nested expressions overflow Chrome's parser
+          // when embedded in a blob worker. non-minified .cjs.js is identical
           if (/\.min\.(js|cjs|mjs)$/.test(resolved)) continue;
           collectDeps(resolved);
         }
       } catch {
-        // Unresolvable dependency — will be handled at runtime
+        // unresolvable, handle at runtime
       }
     }
   }
 
   collectDeps(entryPath);
 
-  // Build the bundle
   const parts: string[] = [];
 
-  // Preamble: minimal runtime stubs
   parts.push(WORKER_PREAMBLE(processEnv));
 
-  // Module registry
   parts.push(`const __modules = {};`);
   parts.push(`const __moduleCache = {};`);
 
-  // Register each collected module.
-  // IMPORTANT: Module source is stored as a STRING, not as a function body.
-  // This avoids V8 parser stack overflow — Chrome's parser has a recursion limit
-  // that blows up when dozens of large module sources are embedded as function
-  // bodies in a single script. By storing as strings, V8 only parses the
-  // top-level string assignments at load time. Each module's code is parsed
-  // lazily via `new Function()` when first required.
+  // IMPORTANT: module source is stored as a STRING, not as a function body
+  // V8's parser has a recursion limit that blows up when dozens of large
+  // module sources are embedded as function bodies in one script. storing
+  // as strings means V8 only parses top-level string assignments at load
+  // time, and each module gets lazily compiled via `new Function()` on first
+  // require
   for (const [filePath, source] of modules) {
     const id = moduleIds.get(filePath)!;
     const dir = filePath.substring(0, filePath.lastIndexOf("/")) || "/";
 
-    // Only convert ESM → CJS for actual ESM files (.mjs or containing import/export).
-    // CJS files (.cjs, .min.js, etc.) must NOT be converted — the regex mangles minified code.
+    // only convert ESM -> CJS for actual ESM files (.mjs or containing import/export)
+    // don't touch CJS files, the regex would mangle minified code
     const isESM = filePath.endsWith(".mjs") ||
       (/\b(import\s+[\w{*]|export\s+(default|const|let|var|function|class|\{|\*))\b/.test(source) &&
        !source.includes("module.exports") && !source.includes("exports.__esModule"));
     let transformed = isESM ? esmToCjs(source) : source;
 
-    // Escape the source for embedding as a string literal.
-    // We use a template-literal-safe encoding: backtick, backslash, ${
+    // escape for embedding as a template literal: backtick, backslash, ${
     const escaped = transformed
       .replace(/\\/g, "\\\\")
       .replace(/`/g, "\\`")
@@ -158,13 +138,10 @@ export function buildNapiWorkerBundle(
     );
   }
 
-  // Module path → id mapping
   parts.push(`const __pathToId = ${JSON.stringify(Object.fromEntries([...moduleIds.entries()]))};`);
 
-  // require() implementation
   parts.push(REQUIRE_IMPL);
 
-  // Entry point execution
   const entryId = moduleIds.get(entryPath);
   if (entryId !== undefined) {
     parts.push(`
@@ -180,25 +157,20 @@ try {
   return parts.join("\n");
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// PatchedWorker: wraps a real Web Worker with Node.js worker_threads API
-// ────────────────────────────────────────────────────────────────────────────
-
 let _nextWasiThreadId = 100;
 
 /**
- * Creates a PatchedWorker constructor that spawns real browser Web Workers
- * for napi-rs WASI worker scripts, falling back to the standard fork-based
- * worker for all other scripts.
+ * makes a PatchedWorker constructor that spawns real browser Web Workers for
+ * napi-rs WASI scripts, falling back to the standard fork-based worker otherwise
  */
 export function createNapiWorkerFactory(
   vol: MemoryVolume,
   resolveModule: (id: string, fromDir: string) => string,
   processEnv: Record<string, string>,
-  fsBridge: any, // The fs bridge for handling __fs__ proxy messages
+  fsBridge: any, // for handling __fs__ proxy messages
   fallbackWorkerFn: ((...args: any[]) => any) | null,
 ) {
-  // Cache bundled scripts per entry path (they don't change at runtime)
+  // bundled scripts don't change at runtime, so cache per entry path
   const bundleCache = new Map<string, string>();
 
   return function PatchedWorkerConstructor(
@@ -208,7 +180,6 @@ export function createNapiWorkerFactory(
   ) {
     const scriptStr = typeof script === "string" ? script : script.href;
 
-    // Detect napi-rs WASI worker scripts
     if (isNapiWasiWorkerScript(scriptStr, vol)) {
       return createRealWebWorker.call(
         this,
@@ -222,7 +193,7 @@ export function createNapiWorkerFactory(
       );
     }
 
-    // Non-WASI workers: fall back to standard fork-based worker
+    // non-WASI: fall back to standard fork-based worker
     if (!fallbackWorkerFn) {
       queueMicrotask(() => {
         this.emit?.(
@@ -235,7 +206,6 @@ export function createNapiWorkerFactory(
       return;
     }
 
-    // Delegate to the standard fork path
     const workerDataVal = opts?.workerData ?? null;
     const isEval = !!opts?.eval;
     const env =
@@ -272,9 +242,9 @@ export function createNapiWorkerFactory(
 }
 
 /**
- * Creates a real browser Web Worker for a napi-rs WASI worker script.
- * The worker gets a bundled copy of the script + all its npm dependencies,
- * plus polyfills for Node.js builtins (worker_threads, path, fs, etc.)
+ * spawns a real browser Web Worker for an napi-rs WASI script
+ * the worker gets a bundled copy of the script + all its npm deps,
+ * plus polyfills for Node.js builtins (worker_threads, path, fs, etc)
  */
 function createRealWebWorker(
   this: any,
@@ -293,7 +263,6 @@ function createRealWebWorker(
   self._terminated = false;
   self._isReffed = false;
 
-  // Build or retrieve cached bundle
   let bundleSource = bundleCache.get(scriptPath);
   if (!bundleSource) {
     try {
@@ -315,13 +284,13 @@ function createRealWebWorker(
     }
   }
 
-  // Create blob URL and spawn real Web Worker
+  // blob URL + real Web Worker
   let realWorker: globalThis.Worker;
   try {
     const blob = new Blob([bundleSource], { type: "application/javascript" });
     const blobUrl = URL.createObjectURL(blob);
     realWorker = new globalThis.Worker(blobUrl, { name: `napi-wasi-${self.threadId}` });
-    // Clean up blob URL after worker starts
+    // revoke after worker has had time to start
     setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
   } catch (err: any) {
     queueMicrotask(() =>
@@ -333,11 +302,11 @@ function createRealWebWorker(
     return;
   }
 
-  // Bridge: real Web Worker ↔ Node.js Worker API
+  // bridge: real Web Worker <-> Node.js Worker API
   realWorker.onmessage = (e: MessageEvent) => {
     const data = e.data;
 
-    // Handle fs proxy requests from the worker (the __fs__ protocol)
+    // __fs__ protocol: fs proxy requests from the worker
     if (data && typeof data === "object" && data.__fs__) {
       handleFsProxy(data.__fs__, fsBridge);
       return;
@@ -350,7 +319,6 @@ function createRealWebWorker(
     self.emit("error", new Error(e.message || "Worker error"));
   };
 
-  // Wire up the Worker API
   self._realWorker = realWorker;
   self.postMessage = (value: unknown, transferList?: unknown[]) => {
     if (!self._terminated) {
@@ -383,7 +351,7 @@ function createRealWebWorker(
     return self;
   };
 
-  // Start reffed (like Node.js)
+  // start reffed like Node.js does
   self._isReffed = true;
   eventLoopRef();
 
@@ -392,16 +360,14 @@ function createRealWebWorker(
   });
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// FS Proxy handler: handles __fs__ messages from WASI workers
-// ────────────────────────────────────────────────────────────────────────────
-
+// handles __fs__ messages from WASI workers
 function handleFsProxy(
   req: { sab: Int32Array; type: string; payload: any[] },
   fsBridge: any,
 ): void {
   const { sab, type, payload } = req;
-  const maxPayload = sab.buffer.byteLength - 16; // SAB size minus 16-byte header
+  const maxPayload = sab.buffer.byteLength - 16; // minus 16-byte header
+
   try {
     const fn = fsBridge[type];
     if (typeof fn !== "function") {
@@ -410,7 +376,7 @@ function handleFsProxy(
 
     let result = fn.apply(fsBridge, payload);
 
-    // Convert stat objects to plain serializable objects
+    // flatten stat objects so they survive structured clone
     if ((type === "statSync" || type === "lstatSync") && result && typeof result.isFile === "function") {
       result = {
         size: result.size,
@@ -433,20 +399,19 @@ function handleFsProxy(
       };
     }
 
-    // Encode result into the SharedArrayBuffer
+    // encode into the SAB
     const encoded = encodeValue(result);
     const resultType = getValueType(result);
 
     Atomics.store(sab, 1, resultType);
     Atomics.store(sab, 2, encoded.byteLength);
-    // Write payload into the SharedArrayBuffer (after 16-byte header)
+    // payload goes after the 16-byte header
     const writeLen = Math.min(encoded.byteLength, maxPayload);
     const payloadView = new Uint8Array(sab.buffer, 16, writeLen);
     payloadView.set(encoded.subarray(0, writeLen));
 
     Atomics.store(sab, 0, 0); // success
   } catch (err: any) {
-    // Encode error
     const errMsg = err?.message || String(err);
     const errCode = err?.code || "";
     const errObj = JSON.stringify({ message: errMsg, code: errCode });
@@ -484,17 +449,13 @@ function encodeValue(v: unknown): Uint8Array {
   if (typeof v === "bigint") return enc.encode(v.toString());
   if (v instanceof Uint8Array) return v;
   if (v instanceof ArrayBuffer) return new Uint8Array(v);
-  // Object — serialize as JSON
+  // object, fall back to JSON
   try {
     return enc.encode(JSON.stringify(v));
   } catch {
     return enc.encode("{}");
   }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────────────
 
 const NODE_BUILTINS = new Set([
   "assert", "async_hooks", "buffer", "child_process", "cluster",
@@ -512,56 +473,56 @@ function isBuiltin(id: string): boolean {
 }
 
 /**
- * Minimal ESM → CJS conversion for worker bundling.
- * Handles the patterns used by @emnapi/*, @napi-rs/*, @tybys/* packages.
+ * minimal ESM -> CJS for worker bundling
+ * covers the patterns used by @emnapi/*, @napi-rs/*, @tybys/* packages
  */
 function esmToCjs(source: string): string {
   let out = source;
 
-  // import X from 'Y' → const X = require('Y')
+  // import X from 'Y' -> const X = require('Y')
   out = out.replace(
     /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
     "const $1 = require('$2');",
   );
 
-  // import { A, B } from 'Y' → const { A, B } = require('Y')
+  // import { A, B } from 'Y' -> const { A, B } = require('Y')
   out = out.replace(
     /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g,
     "const {$1} = require('$2');",
   );
 
-  // import * as X from 'Y' → const X = require('Y')
+  // import * as X from 'Y' -> const X = require('Y')
   out = out.replace(
     /import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
     "const $1 = require('$2');",
   );
 
-  // import 'Y' → require('Y')
+  // import 'Y' -> require('Y')
   out = out.replace(
     /import\s+['"]([^'"]+)['"]\s*;?/g,
     "require('$1');",
   );
 
-  // Remove `const require = createRequire(...)` — the module wrapper already
-  // provides `require` as a parameter. This line is common in napi-rs wasi-worker
-  // scripts and causes "Identifier 'require' has already been declared".
+  // strip `const require = createRequire(...)` - the wrapper already supplies
+  // require as a parameter. napi-rs wasi-worker scripts have this line and it
+  // throws "Identifier 'require' has already been declared"
   out = out.replace(
     /(?:const|let|var)\s+require\s*=\s*createRequire\s*\([^)]*\)\s*;?/g,
     "/* require provided by wrapper */",
   );
 
-  // In real Web Workers, `self` is a read-only getter on WorkerGlobalScope.
-  // napi-rs wasi-worker scripts do Object.assign(globalThis, {self: globalThis, ...})
-  // which throws. Remove `self: globalThis` since self already === globalThis in Workers.
+  // in real Web Workers, `self` is a read-only getter on WorkerGlobalScope
+  // napi-rs does Object.assign(globalThis, {self: globalThis, ...}) which
+  // throws. drop `self: globalThis` since self already === globalThis
   out = out.replace(/self:\s*globalThis\s*,?/g, "/* self already set in Worker */ ");
 
-  // export default X → module.exports.default = X; module.exports = module.exports.default
+  // export default X -> module.exports.default = X
   out = out.replace(
     /export\s+default\s+/g,
     "module.exports.default = ",
   );
 
-  // export { A, B } → module.exports.A = A; module.exports.B = B
+  // export { A, B } -> module.exports.A = A; module.exports.B = B
   out = out.replace(
     /export\s+\{([^}]+)\}\s*;?/g,
     (_, names) => {
@@ -582,13 +543,13 @@ function esmToCjs(source: string): string {
     /export\s+(const|let|var|function|class)\s+(\w+)/g,
     "$1 $2; module.exports.$2 = $2; $1 $2",
   );
-  // Clean up double declarations from the above
+  // clean up double declarations from the rule above
   out = out.replace(
     /(const|let|var)\s+(\w+);\s*module\.exports\.\2\s*=\s*\2;\s*\1\s+\2/g,
     "$1 $2",
   );
 
-  // export { X } from 'Y' → Object.assign(module.exports, require('Y'))
+  // export * from 'Y' -> Object.assign(module.exports, require('Y'))
   out = out.replace(
     /export\s+\*\s+from\s+['"]([^'"]+)['"]\s*;?/g,
     "Object.assign(module.exports, require('$1'));",
@@ -613,19 +574,19 @@ function esmToCjs(source: string): string {
   return out;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Worker preamble: minimal Node.js stubs for running inside a Web Worker
-// ────────────────────────────────────────────────────────────────────────────
-
+// worker preamble: minimal Node.js stubs for running inside a Web Worker
 function WORKER_PREAMBLE(env: Record<string, string>): string {
-  // Inject thread pool size = 0 to disable emnapi's UV thread pool.
-  // Without this, emnapi creates Workers for its async work pool which
-  // crash with TLS corruption in the rolldown WASM binary.
+  // pool size = 0 disables emnapi's UV thread pool in child workers
+  // without this, emnapi tries to create Workers for its async work pool,
+  // but child workers have no onCreateWorker callback
+  // rayon/tokio thread spawning goes via emnapi's child-thread delegation:
+  // child posts 'spawn-thread' to main, main creates Worker, writes TID to SAB
   const workerEnv = {
     ...env,
     UV_THREADPOOL_SIZE: "0",
     EMNAPI_WORKER_POOL_SIZE: "0",
-    RAYON_NUM_THREADS: "1",
+    // don't set RAYON_NUM_THREADS here - WASM reads environ from shared
+    // memory (set by the main thread's _initialize), not this process.env
   };
   return `
 // === nodepod napi-rs WASI worker preamble ===
@@ -691,77 +652,77 @@ globalThis.process = process;
 // Web Worker globals that napi-rs wasi-worker expects.
 // self is already globalThis in a Web Worker (read-only getter, cannot set).
 
-// CRITICAL: Disable WASM child thread spawning.
-// WASM thread spawning via wasi-threads has TLS corruption bugs where child
-// threads crash with "current thread handle already set during thread spawn".
-// We disable at THREE levels for reliability:
-// 1. Override Worker constructor (emnapi uses it to create child workers)
-// 2. Intercept WebAssembly.Instance to replace wasi.thread-spawn with a no-op
-// 3. Intercept WebAssembly.instantiate for async path
-
-// Level 1: Disable Worker constructor at ALL levels of the prototype chain
+// WASM THREADING: emnapi's child-thread delegation model
+//
+// In child-thread mode (childThread: true), emnapi's WASIThreads does NOT
+// create Workers directly. When WASM code calls wasi_thread_spawn, emnapi:
+//   1. Posts a 'spawn-thread' message to the main thread via postMessage
+//   2. Blocks with Atomics.wait() on the errorOrTid struct in shared memory
+//   3. Main thread receives the message, creates a new Worker, writes TID
+//   4. Atomics.notify() wakes the child, which returns the TID to WASM
+//
+// This means child workers don't need the Worker constructor. We keep it
+// disabled as a safety net (preventing accidental direct Worker creation).
+// But we do NOT neuter wasi.thread-spawn — that would break the delegation.
 const __DisabledWorker = class Worker {
-  constructor() { throw new Error('Thread spawning not available in nodepod worker'); }
+  constructor() { throw new Error('Direct Worker creation not available in nodepod child worker (use emnapi child-thread delegation)'); }
 };
-// Override on globalThis (own property)
 try { Object.defineProperty(globalThis, 'Worker', { value: __DisabledWorker, writable: true, configurable: true }); } catch {}
-// Override on prototype chain too (DedicatedWorkerGlobalScope.prototype)
-try {
-  let p = Object.getPrototypeOf(globalThis);
-  while (p && p !== Object.prototype) {
-    try { Object.defineProperty(p, 'Worker', { value: __DisabledWorker, writable: true, configurable: true }); } catch {}
-    p = Object.getPrototypeOf(p);
-  }
-} catch {}
-// Direct assignment fallback
 try { globalThis.Worker = __DisabledWorker; } catch {}
 
-// Level 2: Intercept WebAssembly.Instance to neuter thread-spawn import.
-// This is the most reliable layer — even if Worker override is bypassed,
-// the WASM import itself returns -1 (thread creation failed).
-const __OrigWasmInstance = WebAssembly.Instance;
-const __interceptImports = function(imports) {
-  if (imports) {
-    // Let thread-spawn work naturally — emnapi handles child thread
-    // creation via its instance proxy (no-op _initialize for children).
-    // With RAYON_NUM_THREADS=1 visible in WASI environ, rayon creates
-    // only 1 worker thread. The thread may error during cleanup but
-    // the build operation completes before that happens.
-    // Also check for thread_spawn (underscore variant)
-    if (imports.wasi && typeof imports.wasi['thread_spawn'] === 'function') {
-      imports.wasi['thread_spawn'] = function() { return -1; };
-    }
-    // Neuter env.__wasi_thread_spawn if present
-    if (imports.env && typeof imports.env.__wasi_thread_spawn === 'function') {
-      imports.env.__wasi_thread_spawn = function() { return -1; };
-    }
-  }
-};
-WebAssembly.Instance = function(module, imports) {
-  __interceptImports(imports);
-  return new __OrigWasmInstance(module, imports);
-};
-WebAssembly.Instance.prototype = __OrigWasmInstance.prototype;
-
-// Level 3: Intercept WebAssembly.instantiate for async path
-const __origInstantiate = WebAssembly.instantiate;
-WebAssembly.instantiate = function(source, imports) {
-  __interceptImports(imports);
-  return __origInstantiate.call(WebAssembly, source, imports);
-};
+// DO NOT intercept WebAssembly.Instance or WebAssembly.instantiate.
+// emnapi's WASIThreads provides the wasi.thread-spawn import function.
+// In child-thread mode, it delegates to the main thread via postMessage.
+// Neutering it would make rayon/tokio thread creation fail with EAGAIN,
+// causing "The global thread pool has not been initialized" panics.
 
 try { if (!globalThis.importScripts) globalThis.importScripts = function(f) {}; } catch {};
 
-// parentPort bridge: route Web Worker messages to parentPort listeners
+// Message dispatch: route Web Worker messages to EXACTLY ONE handler path.
+//
+// CRITICAL: emnapi's ThreadMessageHandler._start(payload) has NO idempotence
+// guard — it calls wasi_thread_start(tid, arg) every time it's invoked. If a
+// 'start' message is dispatched twice, wasi_thread_start runs twice with the
+// same (tid, arg), which corrupts per-thread TLS / reuses the stack and
+// traps at "unreachable" or "memory access out of bounds".
+//
+// napi-rs ships TWO worker variants, each using a different delivery model:
+//
+//   1. wasi-worker.mjs (Node variant): registers parentPort.on('message',
+//      data => globalThis.onmessage({data})). This is a TRAMPOLINE — the
+//      parentPort listener re-dispatches to globalThis.onmessage.
+//
+//   2. wasi-worker-browser.mjs (browser variant): NO parentPort listener,
+//      only sets globalThis.onmessage = handler.handle directly.
+//
+// Native Web Worker dispatch uses the event handler internal slot (set when
+// the original prototype setter fired at line "self.onmessage = ...", before
+// we defined our accessor below). That internal slot points to THIS function.
+// Our accessor shadows JS reads/writes but does NOT update the internal slot.
+//
+// So: this function is the ONLY callback native dispatch invokes. We must
+// pick ONE path — parentPort trampoline OR direct globalThis.onmessage — but
+// never both.
 self.onmessage = function(e) {
-  // Forward to globalThis.onmessage if user code sets it
-  if (typeof globalThis.__userOnMessage === 'function') {
+  if (__parentPortListeners.length > 0) {
+    // Node variant: parentPort trampoline will call globalThis.onmessage
+    for (const fn of __parentPortListeners) {
+      try { fn(e.data); } catch (err) { console.error('[wasi-worker] parentPort listener error:', err); }
+    }
+  } else if (typeof globalThis.__userOnMessage === 'function') {
+    // Browser variant: no trampoline, invoke globalThis.onmessage directly
     globalThis.__userOnMessage(e);
   }
-  __parentPortListeners.forEach(fn => fn(e.data));
 };
 
-// Override globalThis.onmessage setter to capture user handler
+// Override globalThis.onmessage setter to capture user handler.
+// User code (wasi-worker.mjs/wasi-worker-browser.mjs) does:
+//   globalThis.onmessage = function(e) { handler.handle(e); };
+// We store the handler here. The native Web Worker dispatcher can't reach it
+// (its internal slot points to the function assigned at line "self.onmessage
+// = function(e)" above, which was stored via the prototype setter BEFORE this
+// defineProperty shadowed the property). So the stored handler is invoked
+// only by our dispatch above — exactly once per message.
 let __userOnMessageFn = null;
 Object.defineProperty(globalThis, 'onmessage', {
   get() { return __userOnMessageFn; },
@@ -881,14 +842,18 @@ function __fsSyncCall(type, args, sabSize) {
   const resultType = Atomics.load(ctrl, 1);
   const payloadLen = Atomics.load(ctrl, 2);
 
-  // Read payload bytes
+  // Read payload bytes. The view is over a SharedArrayBuffer; TextDecoder
+  // rejects shared views, so copy into a regular ArrayBuffer before decoding.
   const maxPayload = size - 16;
-  const payloadBytes = payloadLen > 0 ? new Uint8Array(sab, 16, Math.min(payloadLen, maxPayload)) : null;
+  const payloadView = payloadLen > 0 ? new Uint8Array(sab, 16, Math.min(payloadLen, maxPayload)) : null;
+  const payloadCopy = payloadView ? new Uint8Array(payloadView.length) : null;
+  if (payloadView && payloadCopy) payloadCopy.set(payloadView);
+  const decodePayload = () => payloadCopy ? new TextDecoder().decode(payloadCopy) : '';
 
   if (status === 1) {
     // Error
     let errObj;
-    try { errObj = JSON.parse(new TextDecoder().decode(payloadBytes)); } catch { errObj = { message: 'fs.' + type + ' failed' }; }
+    try { errObj = JSON.parse(decodePayload()); } catch { errObj = { message: 'fs.' + type + ' failed' }; }
     const err = new Error(errObj.message || 'fs.' + type + ' failed');
     if (errObj.code) err.code = errObj.code;
     throw err;
@@ -897,13 +862,13 @@ function __fsSyncCall(type, args, sabSize) {
   // Decode result based on type
   if (resultType === 0) return undefined;
   if (resultType === 1) return null;
-  if (resultType === 2) return new TextDecoder().decode(payloadBytes) === '1';
-  if (resultType === 3) return Number(new TextDecoder().decode(payloadBytes));
-  if (resultType === 4) return new TextDecoder().decode(payloadBytes);
-  if (resultType === 5) return new Uint8Array(payloadBytes); // buffer copy
-  if (resultType === 9) return BigInt(new TextDecoder().decode(payloadBytes));
+  if (resultType === 2) return decodePayload() === '1';
+  if (resultType === 3) return Number(decodePayload());
+  if (resultType === 4) return decodePayload();
+  if (resultType === 5) return payloadCopy ? payloadCopy : new Uint8Array(0); // non-shared buffer copy
+  if (resultType === 9) return BigInt(decodePayload());
   // json/object
-  try { return JSON.parse(new TextDecoder().decode(payloadBytes)); } catch { return {}; }
+  try { return JSON.parse(decodePayload()); } catch { return {}; }
 }
 
 // Get an appropriately-sized SAB for readFileSync — stat the file first to
@@ -948,7 +913,34 @@ const __fsStub = {
     const result = __fsSyncCall('readFileSync', [p, encoding || null], sabSize);
     return result;
   },
-  writeFileSync(p, data, opts) { return __fsSyncCall('writeFileSync', [p, typeof data === 'string' ? data : Array.from(data), opts]); },
+  writeFileSync(p, data, opts) {
+    // Normalize binary data to a fresh (non-shared, non-WASM-memory-backed) Uint8Array
+    // so it survives structured clone intact. napi-rs WASM packages pass a mix of:
+    //   - ArrayBuffer  -> NOT iterable; Array.from returns [] (silent data loss)
+    //   - Uint8Array   -> iterable but may be backed by SAB or WASM memory that grows
+    //   - Buffer       -> Uint8Array subclass; treat like Uint8Array
+    //   - TypedArray   -> other views (Int32Array, etc.)
+    //   - Array        -> plain JS array (rare)
+    // Copy into a fresh ArrayBuffer-backed Uint8Array so the receiver gets proper
+    // binary data (and downstream TextDecoder.decode doesn't throw).
+    let payload = data;
+    if (data != null && typeof data !== 'string') {
+      if (data instanceof ArrayBuffer) {
+        payload = new Uint8Array(data.slice(0));
+      } else if (ArrayBuffer.isView(data)) {
+        const view = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+        const copy = new Uint8Array(view.byteLength);
+        copy.set(view);
+        payload = copy;
+      } else if (Array.isArray(data)) {
+        payload = Uint8Array.from(data);
+      } else if (typeof data.length === 'number') {
+        // Array-like (e.g. Node Buffer polyfill that somehow isn't ArrayBufferView)
+        payload = Uint8Array.from(data);
+      }
+    }
+    return __fsSyncCall('writeFileSync', [p, payload, opts]);
+  },
   existsSync(p) { try { __fsSyncCall('statSync', [p]); return true; } catch { return false; } },
   statSync(p) { return __makeStatObj(__fsSyncCall('statSync', [p])); },
   lstatSync(p) { return __makeStatObj(__fsSyncCall('lstatSync', [p])); },
@@ -1089,9 +1081,11 @@ const __BufferStub = {
 const __wasiStub = { WASI: class WASI {
   constructor(opts) {
     this._opts = opts || {};
-    // ALWAYS merge process.env into WASI env so the WASM module sees
-    // RAYON_NUM_THREADS=1 etc. The wasi-worker.mjs may pass env: {} or
+    // Merge process.env into WASI env. The wasi-worker.mjs may pass env: {} or
     // omit it entirely — either way we need process.env to be visible.
+    // Note: for child threads, _initialize is a no-op (emnapi proxy), so the
+    // WASM code never re-reads environ — it uses the main thread's values
+    // from shared memory. This env is only used by this WASI instance's JS.
     const _procEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
     const _optsEnv = this._opts.env || {};
     this._env = { ..._procEnv, ..._optsEnv };
@@ -1145,6 +1139,16 @@ const __wasiStub = { WASI: class WASI {
     }
     return new TextDecoder().decode(src);
   }
+  // Flush an fd's accumulated in-memory data back to the filesystem.
+  // Called from fd_close / fd_sync / fd_datasync. Without this, every
+  // WASI file write via fd_write would be silently lost.
+  // Mirrors the pattern in src/polyfills/wasi.ts's flushFile().
+  _flushFile(entry) {
+    if (!entry || entry.kind !== 'file' || !entry.dirty || !entry.path) return;
+    const data = entry.data || new Uint8Array(0);
+    __fsStub.writeFileSync(entry.path, data);
+    entry.dirty = false;
+  }
   _buildImports() {
     const E = { SUCCESS: 0, BADF: 8, INVAL: 28, NOENT: 44, NOSYS: 52, IO: 29, ISDIR: 31, NOTDIR: 54, NOTEMPTY: 55, ACCES: 2, EXIST: 20 };
     const self = this;
@@ -1169,17 +1173,33 @@ const __wasiStub = { WASI: class WASI {
           const ptr = dv.getUint32(iovs + i * 8, true);
           const len = dv.getUint32(iovs + i * 8 + 4, true);
           if (ptr + len > b.length) break; // bounds check
-          const chunk = b.slice(ptr, ptr + len);
-          const txt = new TextDecoder().decode(chunk);
-          if (fd === 1) console.log(txt); else if (fd === 2) console.error(txt);
-          else {
-            // File fd: append to fd data
+          // Explicit copy into a non-shared buffer. TextDecoder rejects
+          // SharedArrayBuffer-backed views, and while .slice() should
+          // produce a non-shared copy per spec, being explicit avoids
+          // any engine-specific surprises.
+          const chunk = new Uint8Array(len);
+          chunk.set(b.subarray(ptr, ptr + len));
+          if (fd === 1 || fd === 2) {
+            const txt = new TextDecoder().decode(chunk);
+            if (fd === 1) console.log(txt); else console.error(txt);
+          } else {
+            // File fd: write to fd data at current offset (positional write).
+            // WASI fd_write is positional — it uses entry.offset and advances
+            // it by len. Simply appending would lose data if the app seeks.
+            // If the fd was opened with FDFLAGS_APPEND, all writes go to EOF.
             const entry = self._fds.get(fd);
-            if (entry && entry.data) {
-              const newData = new Uint8Array(entry.data.length + len);
-              newData.set(entry.data);
-              newData.set(chunk, entry.data.length);
-              entry.data = newData;
+            if (entry) {
+              if (!entry.data) entry.data = new Uint8Array(0);
+              const off = entry.append ? entry.data.length : (entry.offset || 0);
+              const end = off + len;
+              if (end > entry.data.length) {
+                const newData = new Uint8Array(end);
+                newData.set(entry.data);
+                entry.data = newData;
+              }
+              entry.data.set(chunk, off);
+              entry.offset = end;
+              entry.dirty = true;
             }
           }
           total += len;
@@ -1209,7 +1229,15 @@ const __wasiStub = { WASI: class WASI {
         self._view().setUint32(nread, total, true);
         return E.SUCCESS;
       },
-      fd_close(fd) { self._fds.delete(fd); return E.SUCCESS; },
+      fd_close(fd) {
+        const entry = self._fds.get(fd);
+        // CRITICAL: flush accumulated write data before closing. Without this,
+        // rolldown-wasm's bundle.write() pipeline (which uses WASI fd_write +
+        // fd_close) would silently drop every byte of every binary file.
+        try { self._flushFile(entry); } catch {}
+        self._fds.delete(fd);
+        return E.SUCCESS;
+      },
       fd_seek(fd, offset, whence, newoff) {
         const entry = self._fds.get(fd);
         const dv = self._view();
@@ -1230,8 +1258,8 @@ const __wasiStub = { WASI: class WASI {
         dv.setBigUint64(off, BigInt(entry ? (entry.offset || 0) : 0), true);
         return E.SUCCESS;
       },
-      fd_sync() { return E.SUCCESS; },
-      fd_datasync() { return E.SUCCESS; },
+      fd_sync(fd) { try { self._flushFile(self._fds.get(fd)); } catch {} return E.SUCCESS; },
+      fd_datasync(fd) { try { self._flushFile(self._fds.get(fd)); } catch {} return E.SUCCESS; },
       fd_advise() { return E.SUCCESS; },
       fd_allocate() { return E.SUCCESS; },
       fd_filestat_get(fd, buf) {
@@ -1251,10 +1279,69 @@ const __wasiStub = { WASI: class WASI {
         dv.setBigUint64(buf + 56, now, true);
         return E.SUCCESS;
       },
-      fd_filestat_set_size() { return E.SUCCESS; },
+      fd_filestat_set_size(fd, size) {
+        const entry = self._fds.get(fd);
+        if (!entry || entry.kind !== 'file') return E.BADF;
+        const newLen = Number(size);
+        const cur = entry.data || new Uint8Array(0);
+        if (newLen === cur.length) return E.SUCCESS;
+        const newData = new Uint8Array(newLen);
+        newData.set(cur.subarray(0, Math.min(cur.length, newLen)));
+        entry.data = newData;
+        entry.dirty = true;
+        if ((entry.offset || 0) > newLen) entry.offset = newLen;
+        return E.SUCCESS;
+      },
       fd_filestat_set_times() { return E.SUCCESS; },
-      fd_pread() { return E.NOSYS; },
-      fd_pwrite() { return E.NOSYS; },
+      fd_pread(fd, iovs, iovs_len, offset, nread) {
+        const entry = self._fds.get(fd);
+        if (!entry || !entry.data) { self._view().setUint32(nread, 0, true); return E.SUCCESS; }
+        let pos = Number(offset);
+        let total = 0;
+        for (let i = 0; i < iovs_len; i++) {
+          const dv = self._view();
+          const b = self._bytes();
+          const ptr = dv.getUint32(iovs + i * 8, true);
+          const len = dv.getUint32(iovs + i * 8 + 4, true);
+          const avail = Math.min(len, entry.data.length - pos);
+          if (avail <= 0) break;
+          if (ptr + avail > b.length) break;
+          b.set(entry.data.subarray(pos, pos + avail), ptr);
+          pos += avail;
+          total += avail;
+        }
+        self._view().setUint32(nread, total, true);
+        return E.SUCCESS;
+      },
+      fd_pwrite(fd, iovs, iovs_len, offset, nwritten) {
+        const entry = self._fds.get(fd);
+        if (!entry || entry.kind !== 'file') { self._view().setUint32(nwritten, 0, true); return E.BADF; }
+        if (!entry.data) entry.data = new Uint8Array(0);
+        let pos = Number(offset);
+        let total = 0;
+        for (let i = 0; i < iovs_len; i++) {
+          const dv = self._view();
+          const b = self._bytes();
+          const ptr = dv.getUint32(iovs + i * 8, true);
+          const len = dv.getUint32(iovs + i * 8 + 4, true);
+          if (ptr + len > b.length) break;
+          const end = pos + len;
+          if (end > entry.data.length) {
+            const newData = new Uint8Array(end);
+            newData.set(entry.data);
+            entry.data = newData;
+          }
+          // Copy non-shared (chunk) to avoid SAB view issues
+          const chunk = new Uint8Array(len);
+          chunk.set(b.subarray(ptr, ptr + len));
+          entry.data.set(chunk, pos);
+          pos += len;
+          total += len;
+        }
+        entry.dirty = true;
+        self._view().setUint32(nwritten, total, true);
+        return E.SUCCESS;
+      },
       fd_readdir(fd, buf, buf_len, cookie, used) {
         const dv = self._view(); const b = self._bytes();
         const entry = self._fds.get(fd);
@@ -1328,7 +1415,9 @@ const __wasiStub = { WASI: class WASI {
         }
         // Regular file
         if (!exists && !wantCreate) return E.NOENT;
+        const wantAppend = (fdflags & 0x0001) !== 0;
         let data;
+        let dirty = false;
         try {
           if (exists && !wantTrunc) {
             const raw = __fsStub.readFileSync(full);
@@ -1337,16 +1426,40 @@ const __wasiStub = { WASI: class WASI {
             if (raw instanceof Uint8Array) {
               data = new Uint8Array(raw.length);
               data.set(raw);
+            } else if (typeof raw === 'string') {
+              data = new TextEncoder().encode(raw);
+            } else if (raw && ArrayBuffer.isView(raw)) {
+              const v = new Uint8Array(raw.buffer, raw.byteOffset || 0, raw.byteLength);
+              data = new Uint8Array(v.byteLength);
+              data.set(v);
+            } else if (raw instanceof ArrayBuffer) {
+              data = new Uint8Array(raw.slice(0));
             } else {
               data = new TextEncoder().encode(String(raw));
             }
           } else {
             data = new Uint8Array(0);
-            if (!exists && wantCreate) try { __fsStub.writeFileSync(full, data); } catch {}
+            if (!exists && wantCreate) {
+              try { __fsStub.writeFileSync(full, data); } catch {}
+            } else if (exists && wantTrunc) {
+              // Truncating an existing file → mark dirty so the empty content
+              // (or whatever gets written next) is flushed on fd_close, even
+              // if no fd_write calls follow.
+              dirty = true;
+            }
           }
         } catch { return E.NOENT; }
         const newFd = self._nextFd++;
-        self._fds.set(newFd, { kind: 'file', path: full, data: data, offset: 0 });
+        // FDFLAGS_APPEND → start at end of existing data
+        const initialOffset = wantAppend ? data.length : 0;
+        self._fds.set(newFd, {
+          kind: 'file',
+          path: full,
+          data: data,
+          offset: initialOffset,
+          dirty: dirty,
+          append: wantAppend,
+        });
         dv.setUint32(fd_out, newFd, true);
         return E.SUCCESS;
       },
