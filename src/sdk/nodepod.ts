@@ -18,6 +18,8 @@ import type {
 import { NodepodFS } from "./nodepod-fs";
 import { NodepodProcess } from "./nodepod-process";
 import { NodepodTerminal } from "./nodepod-terminal";
+import { getCompletions } from "../shell/shell-completions";
+import { builtins as shellBuiltins } from "../shell/shell-builtins";
 import { ProcessManager } from "../threading/process-manager";
 import { setAllowedDomains } from "../cross-origin";
 import type { ProcessHandle } from "../threading/process-handle";
@@ -523,6 +525,8 @@ export class Nodepod {
       setActiveAbort: (ac) => {
         activeAbort = ac;
       },
+      getCompletions: (line: string, cursorPos: number, cwd: string) =>
+        getCompletions(line, cursorPos, cwd, this._volume, shellBuiltins.keys()),
     });
 
     return terminal;

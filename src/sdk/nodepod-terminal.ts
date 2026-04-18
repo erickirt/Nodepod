@@ -31,6 +31,19 @@ const DEFAULT_THEME: TerminalTheme = {
 const DEFAULT_PROMPT = (cwd: string) =>
   `\x1b[36mnodepod\x1b[0m:\x1b[34m${cwd}\x1b[0m$ `;
 
+function longestCommonPrefix(strs: string[]): string {
+  if (strs.length === 0) return "";
+  if (strs.length === 1) return strs[0];
+  let prefix = strs[0];
+  for (let i = 1; i < strs.length && prefix.length > 0; i++) {
+    const s = strs[i];
+    let j = 0;
+    while (j < prefix.length && j < s.length && prefix[j] === s[j]) j++;
+    prefix = prefix.slice(0, j);
+  }
+  return prefix;
+}
+
 // Wired by Nodepod.createTerminal()
 export interface TerminalWiring {
   onCommand: (cmd: string) => Promise<void>;
@@ -38,6 +51,16 @@ export interface TerminalWiring {
   getIsStdinRaw: () => boolean;
   getActiveAbort: () => AbortController | null;
   setActiveAbort: (ac: AbortController | null) => void;
+  /** tab-completion hook. returns candidates + the slice to replace. */
+  getCompletions?: (
+    line: string,
+    cursorPos: number,
+    cwd: string,
+  ) => {
+    token: string;
+    tokenStart: number;
+    matches: string[];
+  };
 }
 
 export class NodepodTerminal {
@@ -287,9 +310,12 @@ export class NodepodTerminal {
         i += 2;
         if (arrow === "A") this._historyUp();
         else if (arrow === "B") this._historyDown();
+      } else if (code === 9) {
+        this._handleTab();
       } else if (code >= 32) {
         this._lineBuffer += ch;
         this._term.write(ch);
+        this._tabCount = 0;
       }
     }
   }
@@ -327,6 +353,97 @@ export class NodepodTerminal {
     );
     this._lineBuffer = text;
     this._term.write(text);
+  }
+
+  /* ---- tab completion ---- */
+
+  // bash style: one match => insert it. several sharing a longer common
+  // prefix => extend to that prefix. otherwise first tab does nothing,
+  // second tab prints the list.
+  private _tabCount = 0;
+
+  private _handleTab(): void {
+    const provider = this._wiring?.getCompletions;
+    if (!provider) return;
+
+    // cursor is always at the end — no mid-line editing yet
+    const cursorPos = this._lineBuffer.length;
+    let result;
+    try {
+      result = provider(this._lineBuffer, cursorPos, this._cwd);
+    } catch {
+      return;
+    }
+    const { token, tokenStart, matches } = result;
+    if (!matches || matches.length === 0) {
+      this._tabCount = 0;
+      return;
+    }
+
+    // the completer adds a trailing ' ' or '/' as a hint. strip it so the
+    // prefix math compares against the raw token.
+    const rawMatches = matches.map((m) =>
+      m.endsWith(" ") || m.endsWith("/") ? m.slice(0, -1) : m,
+    );
+
+    let insertion: string | null = null;
+    if (matches.length === 1) {
+      insertion = matches[0];
+    } else {
+      const lcp = longestCommonPrefix(rawMatches);
+      if (lcp.length > token.length) {
+        // extend to the shared prefix, no trailing space
+        insertion = lcp;
+      }
+    }
+
+    if (insertion !== null) {
+      this._replaceToken(tokenStart, insertion);
+      this._tabCount = 0;
+      return;
+    }
+
+    // still ambiguous. first tab does nothing, second one prints the list.
+    this._tabCount++;
+    if (this._tabCount >= 2) {
+      this._printMatches(matches);
+      this._redrawLine();
+      this._tabCount = 0;
+    }
+  }
+
+  private _replaceToken(tokenStart: number, replacement: string): void {
+    const oldLen = this._lineBuffer.length;
+    const newBuffer = this._lineBuffer.slice(0, tokenStart) + replacement;
+    // erase what's there, then write the replacement
+    const toErase = oldLen - tokenStart;
+    if (toErase > 0) {
+      this._term.write("\b".repeat(toErase) + " ".repeat(toErase) + "\b".repeat(toErase));
+    }
+    this._term.write(replacement);
+    this._lineBuffer = newBuffer;
+  }
+
+  private _printMatches(matches: string[]): void {
+    // drop the trailing space on display
+    const display = matches.map((m) =>
+      m.endsWith(" ") ? m.slice(0, -1) : m,
+    );
+    this._term.write("\r\n");
+    const cols = this._getCols();
+    const maxLen = display.reduce((a, s) => Math.max(a, s.length), 0);
+    const colWidth = maxLen + 2;
+    const perRow = Math.max(1, Math.floor(cols / colWidth));
+    for (let i = 0; i < display.length; i++) {
+      const cell = display[i].padEnd(colWidth, " ");
+      this._term.write(cell);
+      if ((i + 1) % perRow === 0) this._term.write("\r\n");
+    }
+    if (display.length % perRow !== 0) this._term.write("\r\n");
+  }
+
+  private _redrawLine(): void {
+    this._term.write(this._promptFn(this._cwd) + this._lineBuffer);
   }
 
   /* ---- Command execution ---- */
