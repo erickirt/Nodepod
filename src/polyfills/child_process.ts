@@ -44,16 +44,15 @@ let _rawModeChangeCb: ((isRaw: boolean) => void) | null = null;
 const _activeProcs = new Set<{
   stdout: { _setSize?: (c: number, r: number) => boolean };
   stderr: { _setSize?: (c: number, r: number) => boolean };
-  stdin: { _setSize?: (c: number, r: number) => boolean };
 }>();
 
 // called by the worker when it gets a "resize" from the main thread.
-// updates every live proc's stdout/stderr/stdin and emits 'resize' on each.
+// matches Node: only stdout and stderr fire 'resize', stdin is a ReadStream
+// and doesn't have the event at all.
 export function notifyTerminalResize(cols: number, rows: number): void {
   for (const p of _activeProcs) {
     p.stdout?._setSize?.(cols, rows);
     p.stderr?._setSize?.(cols, rows);
-    p.stdin?._setSize?.(cols, rows);
   }
 }
 
@@ -1166,8 +1165,8 @@ export async function executeNodeBinary(
     proc.stdout.rows = rows;
     proc.stderr.columns = cols;
     proc.stderr.rows = rows;
-    proc.stdin.columns = cols;
-    proc.stdin.rows = rows;
+    // stdin intentionally skipped -- real Node's tty.ReadStream has no
+    // columns/rows/resize, TUIs watch process.stdout for dimensions
     proc.stdin.setRawMode = (flag: boolean) => {
       proc.stdin.isRaw = flag;
       // notify terminal so it switches echo mode

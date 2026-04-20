@@ -391,49 +391,52 @@ function fabricateStream(
     };
   }
 
-  // swap the plain columns/rows properties for accessors that emit 'resize'
-  // if someone assigns the same value we don't emit, otherwise watchers get
-  // spammed on every fit() call even when the size didn't actually change
-  let _silent = false;
-  Object.defineProperty(stream, "columns", {
-    get() { return _cols; },
-    set(v: number) {
-      const n = typeof v === "number" ? v : Number(v);
-      if (!Number.isFinite(n) || n === _cols) return;
-      _cols = n;
-      if (!_silent) bus.emit("resize");
-    },
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(stream, "rows", {
-    get() { return _rows; },
-    set(v: number) {
-      const n = typeof v === "number" ? v : Number(v);
-      if (!Number.isFinite(n) || n === _rows) return;
-      _rows = n;
-      if (!_silent) bus.emit("resize");
-    },
-    enumerable: true,
-    configurable: true,
-  });
+  // only the output streams (stdout/stderr) fire 'resize' in real Node,
+  // since stdin is a tty.ReadStream which has no columns/rows/resize.
+  // we still keep columns/rows on the stdin object for back-compat with
+  // anything that was already reading them, but we don't emit anything.
+  if (isOutput) {
+    let _silent = false;
+    Object.defineProperty(stream, "columns", {
+      get() { return _cols; },
+      set(v: number) {
+        const n = typeof v === "number" ? v : Number(v);
+        if (!Number.isFinite(n) || n === _cols) return;
+        _cols = n;
+        if (!_silent) bus.emit("resize");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(stream, "rows", {
+      get() { return _rows; },
+      set(v: number) {
+        const n = typeof v === "number" ? v : Number(v);
+        if (!Number.isFinite(n) || n === _rows) return;
+        _rows = n;
+        if (!_silent) bus.emit("resize");
+      },
+      enumerable: true,
+      configurable: true,
+    });
 
-  // update both at once, emit 'resize' once. individual setter assignments
-  // still emit as usual, this is just for the common "new size came in" case.
-  (stream as any)._setSize = (cols: number, rows: number): boolean => {
-    const colsChanged = Number.isFinite(cols) && cols !== _cols;
-    const rowsChanged = Number.isFinite(rows) && rows !== _rows;
-    if (!colsChanged && !rowsChanged) return false;
-    _silent = true;
-    try {
-      if (colsChanged) (stream as any).columns = cols;
-      if (rowsChanged) (stream as any).rows = rows;
-    } finally {
-      _silent = false;
-    }
-    bus.emit("resize");
-    return true;
-  };
+    // update both at once, emit 'resize' once. individual setter assignments
+    // still emit as usual, this is just for the common "new size came in" case.
+    (stream as any)._setSize = (cols: number, rows: number): boolean => {
+      const colsChanged = Number.isFinite(cols) && cols !== _cols;
+      const rowsChanged = Number.isFinite(rows) && rows !== _rows;
+      if (!colsChanged && !rowsChanged) return false;
+      _silent = true;
+      try {
+        if (colsChanged) (stream as any).columns = cols;
+        if (rowsChanged) (stream as any).rows = rows;
+      } finally {
+        _silent = false;
+      }
+      bus.emit("resize");
+      return true;
+    };
+  }
 
   return stream;
 }

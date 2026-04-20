@@ -176,5 +176,24 @@ describe("process polyfill", () => {
       proc.stdout.columns = Number.NaN;
       expect(proc.stdout.columns).toBe(100);
     });
+
+    it("also fires 'resize' on stderr (Node-accurate, both WriteStreams emit)", () => {
+      const proc = buildProcessEnv();
+      const fn = vi.fn();
+      proc.stderr.on("resize", fn);
+      const changed = setStreamDimensions(proc.stderr as any, 140, 42);
+      expect(changed).toBe(true);
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT fire 'resize' on stdin (matches tty.ReadStream)", () => {
+      const proc = buildProcessEnv();
+      const fn = vi.fn();
+      proc.stdin.on("resize", fn);
+      // stdin has no _setSize. setStreamDimensions is a no-op.
+      const changed = setStreamDimensions(proc.stdin as any, 140, 42);
+      expect(changed).toBe(false);
+      expect(fn).not.toHaveBeenCalled();
+    });
   });
 });
