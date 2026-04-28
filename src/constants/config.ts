@@ -186,7 +186,16 @@ export const TIMEOUTS = {
   WORKER_INIT_TIMEOUT: 30_000,
   HTTP_KEEP_ALIVE: 5000,
   HTTP_HEADERS: 60000,
-  HTTP_DISPATCH_SAFETY: 120000,
+  // Cold-start budget for an in-process HTTP request handler. Some Vite plugin
+  // pipelines do real work the FIRST time a request arrives -- e.g. Tailwind
+  // v4's @tailwindcss/vite spins up @tailwindcss/oxide-wasm32-wasi, which
+  // compiles a large napi-rs WASM, instantiates emnapi's worker pool and runs
+  // an initial content scan -- while rolldown is still streaming dep-
+  // optimization tsfn calls into the same engine-worker thread. The combined
+  // load can push the first /src/index.css response past 2 minutes (issue #54),
+  // so we give it a generous ceiling. Subsequent requests hit warm caches and
+  // return in milliseconds.
+  HTTP_DISPATCH_SAFETY: 300000,
 } as const;
 
 export const LIMITS = {

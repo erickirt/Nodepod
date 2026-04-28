@@ -512,7 +512,11 @@ export default App;
         let allOk = false;
         const results = {};
         const probeStart = performance.now();
-        while (performance.now() - probeStart < 60000) {
+        // Tailwind v4's first request can take 2-4 minutes the first time
+        // because @tailwindcss/oxide-wasm32-wasi has to compile + init while
+        // rolldown is still optimizing deps on the same engine-worker. After
+        // that everything is cached. Give it 5 minutes.
+        while (performance.now() - probeStart < 300000) {
           allOk = true;
           for (const u of probeUrls) {
             try {
