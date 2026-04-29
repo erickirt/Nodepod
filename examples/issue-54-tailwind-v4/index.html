@@ -471,6 +471,168 @@ export default App;
         }
         log('npm install done.\n', 'pass');
 
+        // diagnostic probe: invoke @tailwindcss/oxide's Scanner directly with
+        // the same source-detection oxide uses internally. this isolates
+        // whether oxide can see App.tsx's classes at all, before vite gets
+        // involved. each experiment prints its wall-clock duration so we can
+        // see whether oxide is fast (matches native node) or hanging on a
+        // wasi syscall path.
+        log('--- diagnostic: probing tailwind v4 oxide scanner ---', 'title');
+        const diagStart = performance.now();
+        try {
+          const probeScript = [
+            "const fs = require('fs');",
+            "const path = require('path');",
+            "console.log('cwd=' + process.cwd());",
+            "// helper: timed wrapper that returns ms",
+            "function tick(label, fn) {",
+            "  const t0 = Date.now();",
+            "  let r, err;",
+            "  try { r = fn(); } catch (e) { err = e; }",
+            "  const dt = Date.now() - t0;",
+            "  if (err) { console.log('[' + dt + 'ms] ' + label + ' THREW: ' + err.message + ' :: ' + (err.stack||'').split('\\n').slice(0,4).join(' | ')); return null; }",
+            "  console.log('[' + dt + 'ms] ' + label);",
+            "  return r;",
+            "}",
+            "// monkey-patch fs to log every call oxide makes. shows us what is",
+            "// happening during those 60-90s scans where oxide returns 0 candidates.",
+            "// only logs slow/failed/interesting ones so we don't flood with",
+            "// successful millisecond reads.",
+            "const fsCallLog = [];",
+            "function wrapFs(name) {",
+            "  const orig = fs[name];",
+            "  if (typeof orig !== 'function') return;",
+            "  fs[name] = function(...a) {",
+            "    const t0 = Date.now();",
+            "    try {",
+            "      const r = orig.apply(this, a);",
+            "      const dt = Date.now() - t0;",
+            "      if (dt > 100 || /readdirSync|statSync|readFileSync|existsSync|lstatSync|realpathSync/.test(name)) {",
+            "        const argSummary = a.length > 0 ? (typeof a[0] === 'string' ? a[0] : JSON.stringify(a[0])) : '';",
+            "        fsCallLog.push({ t: t0, dt, name, arg: argSummary.slice(0, 200), ok: true });",
+            "      }",
+            "      return r;",
+            "    } catch (e) {",
+            "      const dt = Date.now() - t0;",
+            "      const argSummary = a.length > 0 ? (typeof a[0] === 'string' ? a[0] : JSON.stringify(a[0])) : '';",
+            "      fsCallLog.push({ t: t0, dt, name, arg: argSummary.slice(0, 200), ok: false, err: e.message });",
+            "      throw e;",
+            "    }",
+            "  };",
+            "}",
+            "['readdirSync','statSync','lstatSync','readFileSync','existsSync','realpathSync','readlinkSync','accessSync','openSync','readSync','closeSync'].forEach(wrapFs);",
+            "function dumpFsLog(label) {",
+            "  console.log('--- fs calls during ' + label + ' (' + fsCallLog.length + ' total) ---');",
+            "  // group by op name and arg",
+            "  const counts = {};",
+            "  let slowOps = [];",
+            "  for (const c of fsCallLog) {",
+            "    const k = c.name + (c.ok ? '' : ' FAIL');",
+            "    counts[k] = (counts[k] || 0) + 1;",
+            "    if (c.dt > 1000) slowOps.push(c);",
+            "  }",
+            "  for (const k of Object.keys(counts).sort()) console.log('  ' + k + ': ' + counts[k]);",
+            "  if (slowOps.length) {",
+            "    console.log('  slow ops (>1s):');",
+            "    for (const c of slowOps.slice(0, 20)) console.log('    [' + c.dt + 'ms] ' + c.name + '(' + c.arg + ')' + (c.ok ? '' : ' THREW: ' + c.err));",
+            "  }",
+            "  fsCallLog.length = 0;",
+            "}",
+            "(async () => {",
+            "  const t_total = Date.now();",
+            "  let oxide;",
+            "  oxide = tick('require @tailwindcss/oxide', () => require('@tailwindcss/oxide'));",
+            "  if (!oxide) return;",
+            "  console.log('  exports=' + Object.keys(oxide).join(','));",
+            "  if (typeof oxide.Scanner !== 'function') { console.log('Scanner not exported'); return; }",
+            "  // experiment 0a: skip JS wrapper (just delegates to napi-rs),",
+            "  // dump the actual @tailwindcss/oxide-wasm32-wasi entry which",
+            "  // is what runs the WASM. that's where the bug lives.",
+            "  console.log('--- experiment 0a: oxide-wasm32-wasi entry structure ---');",
+            "  try {",
+            "    const wasiEntry = require.resolve('@tailwindcss/oxide-wasm32-wasi');",
+            "    console.log('  resolved to: ' + wasiEntry);",
+            "    const main = fs.readFileSync(wasiEntry, 'utf8');",
+            "    console.log('  size: ' + main.length + ' bytes');",
+            "    // dump first 3000 chars",
+            "    console.log('  head:\\n' + main.slice(0, 3000));",
+            "    // also dump indicator of where Scanner.scan implementation is",
+            "    const scanIdx = main.indexOf('Scanner');",
+            "    if (scanIdx > 0) console.log('  Scanner around offset ' + scanIdx + ': ' + main.slice(scanIdx, scanIdx + 600));",
+            "    // hunt for sources/scan logic",
+            "    for (const needle of ['scan(', 'sources', 'walkdir', 'thread', 'spawn']) {",
+            "      const i = main.indexOf(needle);",
+            "      if (i >= 0) console.log('  found \"' + needle + '\" at ' + i + ': ' + JSON.stringify(main.slice(Math.max(0, i - 80), i + 150)));",
+            "    }",
+            "  } catch (e) { console.log('  exp0a threw: ' + e.message); }",
+            "",
+            "  // experiment 1: explicit absolute base + broad pattern, mirrors what",
+            "  // @tailwindcss/vite hands oxide for auto-detected sources.",
+            "  fsCallLog.length = 0;",
+            "  if (globalThis.__nodepodFsBridgeCounter) globalThis.__nodepodFsBridgeCounter.count = globalThis.__nodepodFsBridgeCounter.fail = globalThis.__nodepodFsBridgeCounter.slow = 0;",
+            "  const s1 = tick('exp1 new Scanner({base:/app, pattern:**/*})', () => new oxide.Scanner({ sources: [{ base: '/app', pattern: '**/*', negated: false }] }));",
+            "  if (s1) {",
+            "    const c1 = tick('exp1 .scan()', () => s1.scan());",
+            "    if (c1) {",
+            "      console.log('  exp1 candidates: ' + c1.length);",
+            "      console.log('  exp1 sample (first 30): ' + JSON.stringify(c1.slice(0, 30)));",
+            "      const stringify = (c) => typeof c === 'string' ? c : (c.candidate || c.name || '');",
+            "      console.log('  exp1 contains min-h-screen=' + c1.some(c => stringify(c).includes('min-h-screen')) + '  contains text-cyan-300=' + c1.some(c => stringify(c).includes('cyan-300')));",
+            "    }",
+            "    if (globalThis.__nodepodFsBridgeCounter) console.log('  exp1 FS BRIDGE total=' + globalThis.__nodepodFsBridgeCounter.count + ' slow=' + globalThis.__nodepodFsBridgeCounter.slow + ' fail=' + globalThis.__nodepodFsBridgeCounter.fail);",
+            "    else console.log('  exp1 FS BRIDGE counter not initialized (no bridge calls happened)');",
+            "    dumpFsLog('exp1');",
+            "  }",
+            "  // experiment 2: scoped to /app/src so we exclude node_modules entirely",
+            "  fsCallLog.length = 0;",
+            "  if (globalThis.__nodepodFsBridgeCounter) globalThis.__nodepodFsBridgeCounter.count = globalThis.__nodepodFsBridgeCounter.fail = globalThis.__nodepodFsBridgeCounter.slow = 0;",
+            "  const s2 = tick('exp2 new Scanner({base:/app/src, pattern:**/*})', () => new oxide.Scanner({ sources: [{ base: '/app/src', pattern: '**/*', negated: false }] }));",
+            "  if (s2) {",
+            "    const c2 = tick('exp2 .scan()', () => s2.scan());",
+            "    if (c2) {",
+            "      console.log('  exp2 candidates: ' + c2.length);",
+            "      console.log('  exp2 sample (first 20): ' + JSON.stringify(c2.slice(0, 20)));",
+            "    }",
+            "    if (globalThis.__nodepodFsBridgeCounter) console.log('  exp2 FS BRIDGE total=' + globalThis.__nodepodFsBridgeCounter.count + ' slow=' + globalThis.__nodepodFsBridgeCounter.slow + ' fail=' + globalThis.__nodepodFsBridgeCounter.fail);",
+            "    else console.log('  exp2 FS BRIDGE counter not initialized (no bridge calls happened)');",
+            "    dumpFsLog('exp2 (only 4 files in /app/src, baseline)');",
+            "  }",
+            "  // experiment 3: pass App.tsx directly (single file pattern)",
+            "  const s3 = tick('exp3 new Scanner({base:/app/src, pattern:App.tsx})', () => new oxide.Scanner({ sources: [{ base: '/app/src', pattern: 'App.tsx', negated: false }] }));",
+            "  if (s3) {",
+            "    const c3 = tick('exp3 .scan()', () => s3.scan());",
+            "    if (c3) {",
+            "      console.log('  exp3 candidates: ' + c3.length);",
+            "      console.log('  exp3 sample (first 20): ' + JSON.stringify(c3.slice(0, 20)));",
+            "    }",
+            "  }",
+            "  // experiment 4: ad-hoc -- pass file content directly via scanFiles",
+            "  if (typeof oxide.scanFiles === 'function') {",
+            "    const apptsxContent = fs.readFileSync('/app/src/App.tsx', 'utf8');",
+            "    const c4 = tick('exp4 oxide.scanFiles([{content,extension:tsx}])', () => oxide.scanFiles([{ content: apptsxContent, extension: 'tsx' }]));",
+            "    if (c4) {",
+            "      console.log('  exp4 candidates: ' + c4.length);",
+            "      console.log('  exp4 sample (first 20): ' + JSON.stringify(c4.slice(0, 20)));",
+            "    }",
+            "  } else {",
+            "    console.log('experiment 4 skipped: oxide.scanFiles not exported');",
+            "  }",
+            "  console.log('--- v4 oxide diagnostic total: ' + (Date.now() - t_total) + 'ms ---');",
+            "})();",
+            "",
+          ].join('\n');
+          await pod.fs.writeFile('/app/__nodepod_v4_probe.cjs', probeScript);
+          const probeProc = await pod.spawn('node', ['/app/__nodepod_v4_probe.cjs'], { cwd: '/app' });
+          probeProc.on('output', (t) => log(t.trimEnd(), 'info'));
+          probeProc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+          await probeProc.completion;
+        } catch (e) {
+          log('v4 probe failed: ' + e.message, 'stderr');
+        }
+        const diagDur = ((performance.now() - diagStart) / 1000).toFixed(1);
+        log(`--- diagnostic finished in ${diagDur}s (wall-clock from spawn to exit) ---`, 'info');
+        log('', 'dim');
+
         log('--- npm run dev ---', 'title');
         setStatus('starting dev server ...', 'warn');
         const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
@@ -543,6 +705,28 @@ export default App;
         }
 
         if (allOk) {
+          // diagnostic: fetch the served /src/index.css and count utility
+          // class definitions. tailwind v4 oxide is a WASM scanner -- if it
+          // can't see the source files for any reason (vfs path resolution,
+          // mmap fallback, fd_readdir, etc.) the served CSS contains only
+          // base/preflight rules and no utilities. that's the symptom users
+          // see as "no styling".
+          try {
+            const cssRes = await fetch(new URL('src/index.css', base).toString(), { cache: 'no-store' });
+            const cssText = await cssRes.text();
+            const utilityCount = (cssText.match(/\n\.[a-zA-Z][a-zA-Z0-9_\\:\-]*\s*\{/g) || []).length;
+            const hasMinHScreen = cssText.includes('.min-h-screen');
+            const hasBgSlate = cssText.includes('.bg-slate-900');
+            const hasCyan = cssText.includes('.text-cyan-300');
+            log(`served /src/index.css: ${cssText.length} bytes, ~${utilityCount} utility classes`, 'info');
+            log(`  has .min-h-screen=${hasMinHScreen}  has .bg-slate-900=${hasBgSlate}  has .text-cyan-300=${hasCyan}`, 'info');
+            if (utilityCount === 0) {
+              log(`  CSS preview (first 400 chars):`, 'dim');
+              log(cssText.slice(0, 400), 'dim');
+            }
+          } catch (e) {
+            log(`css introspection failed: ${e.message}`, 'stderr');
+          }
           log(`\nPASS: dev server reachable, including dep chunks. pointing iframe at ${url}`, 'pass');
           setStatus('ready', 'pass');
           frame.src = url;
