@@ -50,9 +50,12 @@ createServer((req, res) => {
   console.log(`  Vite build test:      http://localhost:${port}/examples/vite-build-test/`);
   console.log(`  Native WASI test:     http://localhost:${port}/examples/native-wasi-test/`);
   console.log(`  SW setup DX:          http://localhost:${port}/examples/sw-setup/`);
+  console.log(`  Custom commands:      http://localhost:${port}/examples/custom-commands/`);
   console.log(`  Terminal resize:      http://localhost:${port}/examples/terminal-resize/`);
   console.log(`  Shared FS attach:     http://localhost:${port}/examples/shared-fs-attach/`);
   console.log(`  SAB opt-out:          http://localhost:${port}/examples/sab-opt-out/`);
   console.log(`  Multi-boot race (#39):http://localhost:${port}/examples/multi-boot-race/`);
+  console.log(`  Tailwind v4 (#54):    http://localhost:${port}/examples/issue-54-tailwind-v4/`);
+  console.log(`  Tailwind v3 + vite 8: http://localhost:${port}/examples/tailwind-v3-test/`);
   console.log(`  typebox 1.x (#56):    http://localhost:${port}/examples/issue-56-typebox-1x/`);
 });

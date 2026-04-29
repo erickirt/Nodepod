@@ -615,6 +615,14 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
 
     const timeoutMs = self.timeout || TIMEOUTS.HTTP_DISPATCH_SAFETY;
     const timer = setTimeout(() => {
+      // tell the user which request stalled so they can correlate it with
+      // whatever wasi/rolldown chatter was going on
+      try {
+        const stderr = (globalThis as any).process?.stderr;
+        const line = `[nodepod] dispatchRequest TIMEOUT after ${timeoutMs}ms for ${verb} ${target}, middleware never responded\n`;
+        if (stderr && typeof stderr.write === "function") stderr.write(line);
+        else console.error(line);
+      } catch {}
       reject(
         new Error(
           `dispatchRequest timed out after ${timeoutMs}ms for ${verb} ${target}`,
@@ -626,6 +634,20 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
       clearTimeout(timer);
     });
 
+    // surface middleware errors to both console.error AND stderr.write so they
+    // reach the parent log even from inside a worker. without this a 500 on
+    // /src/index.css is silent.
+    const reportErr = (kind: "async" | "sync", err: unknown) => {
+      const msg = (err as Error)?.message || String(err);
+      const stack = (err as Error)?.stack?.split("\n").slice(0, 8).join("\n") ?? "";
+      const line = `[nodepod] dispatchRequest ${kind} error on ${verb} ${target}: ${msg}\n${stack}\n`;
+      try { console.error(line); } catch {}
+      try {
+        const stderr = (globalThis as any).process?.stderr;
+        if (stderr && typeof stderr.write === "function") stderr.write(line);
+      } catch {}
+    };
+
     try {
       self.emit("request", req, res);
       if (typeof self._handler === "function") {
@@ -633,7 +655,7 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
         if (result && typeof (result as any).then === "function") {
           (result as Promise<unknown>).catch((err) => {
             clearTimeout(timer);
-            console.error("[DEBUG] dispatchRequest async error:", (err as Error)?.message || err, (err as Error)?.stack?.split("\n").slice(0, 5).join("\n"));
+            reportErr("async", err);
             if (!res.headersSent) {
               try {
                 res.statusCode = 500;
@@ -647,7 +669,7 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
       }
     } catch (err) {
       clearTimeout(timer);
-      console.error("[DEBUG] dispatchRequest sync error:", (err as Error)?.message || err, (err as Error)?.stack?.split("\n").slice(0, 5).join("\n"));
+      reportErr("sync", err);
       if (!res.headersSent) {
         try {
           res.statusCode = 500;

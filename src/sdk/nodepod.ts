@@ -19,6 +19,7 @@ import { NodepodFS } from "./nodepod-fs";
 import { NodepodProcess } from "./nodepod-process";
 import { NodepodTerminal } from "./nodepod-terminal";
 import { getCompletions } from "../shell/shell-completions";
+import { parse as parseShell } from "../shell/shell-parser";
 import { builtins as shellBuiltins } from "../shell/shell-builtins";
 import { ProcessManager } from "../threading/process-manager";
 import { setAllowedDomains } from "../cross-origin";
@@ -33,6 +34,8 @@ import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
 import { openSnapshotCache } from "../persistence/idb-cache";
+import { handleFsProxy } from "../helpers/napi-wasm-worker";
+import { buildFileSystemBridge } from "../polyfills/fs";
 
 // short url-safe id. always starts with a letter so it can't be confused
 // with a port number in /__virtual__/{id}/{port}
@@ -51,6 +54,23 @@ function shellQuote(arg: string): string {
   if (/^[A-Za-z0-9_\-./:=@%+,]+$/.test(arg)) return arg;
   // single-quote it, escape any inner quotes the posix way
   return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+
+function parseSimpleCommand(
+  input: string,
+  env: Record<string, string>,
+): { name: string; args: string[] } | null {
+  const ast = parseShell(input, env);
+  if (ast.entries.length !== 1 || ast.entries[0].next) return null;
+
+  const pipeline = ast.entries[0].pipeline;
+  if (pipeline.commands.length !== 1) return null;
+
+  const command = pipeline.commands[0];
+  if (command.redirects.length || command.args.length === 0) return null;
+
+  const [name, ...args] = command.args;
+  return { name, args };
 }
 
 export class Nodepod {
@@ -73,6 +93,7 @@ export class Nodepod {
   private _unwatchVFS: (() => void) | null = null;
   private _handler: MemoryHandler;
   private _sabEnabled: boolean;
+  private _wasiFsChannel: BroadcastChannel | null = null;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -212,6 +233,28 @@ export class Nodepod {
     handler.startMonitoring();
     const volume = new MemoryVolume(handler);
 
+    // fs bridge for napi-rs WASI workers (tailwind v4 oxide, rolldown, etc).
+    // they call fs from inside a Web Worker which would normally route
+    // through the spawned process, but that process is often in sync WASM
+    // and cant drain its message queue. listen on the same channel here
+    // (browser tab is idle) and service the request against MemoryVolume.
+    let wasiFsChannel: BroadcastChannel | null = null;
+    if (typeof BroadcastChannel !== "undefined") {
+      try {
+        const tabFsBridge = buildFileSystemBridge(volume, () => "/");
+        wasiFsChannel = new BroadcastChannel("nodepod-wasi-fs");
+        wasiFsChannel.onmessage = (e: MessageEvent) => {
+          const data = e.data;
+          if (!data || typeof data !== "object" || !data.__fs__) return;
+          handleFsProxy(data.__fs__, tabFsBridge);
+        };
+      } catch (err) {
+        if (typeof console !== "undefined") {
+          console.warn("[Nodepod] WASI fs broadcast bridge setup failed:", err);
+        }
+      }
+    }
+
     // Open IDB snapshot cache for faster re-boots (opt-out via enableSnapshotCache: false)
     let snapshotCache = null;
     if (opts.enableSnapshotCache !== false) {
@@ -244,6 +287,7 @@ export class Nodepod {
       sabEnabled,
       makeInstanceId(),
     );
+    nodepod._wasiFsChannel = wasiFsChannel;
 
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {
@@ -404,6 +448,8 @@ export class Nodepod {
   createTerminal(opts: TerminalOptions): NodepodTerminal {
     const terminal = new NodepodTerminal(opts);
     terminal.setCwd(this._cwd);
+    const customCommands = opts.customCommands ?? {};
+    const customCommandNames = Object.keys(customCommands);
 
     let activeAbort: AbortController | null = null;
     let currentSendStdin: ((data: string) => void) | null = null;
@@ -495,6 +541,31 @@ export class Nodepod {
             wroteNewline = true;
             terminal.write("\r\n");
           }
+        }
+
+        const simpleCommand = parseSimpleCommand(cmd, this._env);
+        if (simpleCommand && customCommands[simpleCommand.name]) {
+          try {
+            const output = customCommands[simpleCommand.name](
+              terminal.getCwd(),
+              simpleCommand.args,
+            );
+            if (output) {
+              ensureNewline();
+              terminal._writeOutput(output);
+            }
+          } catch (err) {
+            ensureNewline();
+            const message = err instanceof Error ? err.message : String(err);
+            terminal._writeOutput(`${simpleCommand.name}: ${message}\n`, true);
+          } finally {
+            if (activeAbort === myAbort) activeAbort = null;
+            currentSendStdin = null;
+            if (!wroteNewline) terminal.write("\r\n");
+            terminal._setRunning(false);
+            terminal._writePrompt();
+          }
+          return;
         }
 
         // Ensure persistent shell worker is running
@@ -611,7 +682,9 @@ export class Nodepod {
         activeAbort = ac;
       },
       getCompletions: (line: string, cursorPos: number, cwd: string) =>
-        getCompletions(line, cursorPos, cwd, this._volume, shellBuiltins.keys()),
+        getCompletions(line, cursorPos, cwd, this._volume, shellBuiltins.keys(), {
+          extraCommands: customCommandNames,
+        }),
       onResize: forwardResize,
     });
 
@@ -684,6 +757,10 @@ export class Nodepod {
       this._proxy.detach(this.instanceId);
     } catch {
       /* */
+    }
+    if (this._wasiFsChannel) {
+      try { this._wasiFsChannel.close(); } catch { /* */ }
+      this._wasiFsChannel = null;
     }
     this._processManager.teardown();
     this._volume.dispose();
