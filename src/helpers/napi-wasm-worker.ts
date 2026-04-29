@@ -180,8 +180,9 @@ export function createNapiWorkerFactory(
     opts?: any,
   ) {
     const scriptStr = typeof script === "string" ? script : script.href;
+    const isWasi = isNapiWasiWorkerScript(scriptStr, vol);
 
-    if (isNapiWasiWorkerScript(scriptStr, vol)) {
+    if (isWasi) {
       // threaded wasi needs SAB for Atomics.wait, would deadlock without it
       if (!sabEnabled) {
         queueMicrotask(() => {
@@ -297,12 +298,17 @@ function createRealWebWorker(
 
   // blob URL + real Web Worker
   let realWorker: globalThis.Worker;
+  const workerSpawnT0 = Date.now();
   try {
+    const counter = ((globalThis as any).__nodepodWasiWorkerCounter ||= { spawned: 0, errors: 0 });
+    counter.spawned++;
+    console.log(`[wasi-bridge] spawning WASI worker #${counter.spawned} threadId=${self.threadId} script=${scriptPath}`);
     const blob = new Blob([bundleSource], { type: "application/javascript" });
     const blobUrl = URL.createObjectURL(blob);
     realWorker = new globalThis.Worker(blobUrl, { name: `napi-wasi-${self.threadId}` });
     // revoke after worker has had time to start
     setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+    console.log(`[wasi-bridge] WASI worker #${counter.spawned} (threadId=${self.threadId}) constructed in ${Date.now() - workerSpawnT0}ms`);
   } catch (err: any) {
     queueMicrotask(() =>
       self.emit(
@@ -313,7 +319,16 @@ function createRealWebWorker(
     return;
   }
 
-  // bridge: real Web Worker <-> Node.js Worker API
+  // bridge: real Web Worker <-> Node.js Worker API.
+  //
+  // emnapi's child-thread delegation posts {type: 'spawn-thread', ...} (or
+  // similar) when WASM calls wasi.thread-spawn. nodepod's PatchedWorker -- the
+  // user-visible Worker handler -- needs to receive that and create a child
+  // Worker. We log non-__fs__ messages here once per type so we can see the
+  // emnapi protocol traffic when something hangs (issue #54 v4: oxide's
+  // rayon thread pool can't init because spawn-thread messages aren't
+  // routed correctly).
+  const _seenMsgTypes = new Set<string>();
   realWorker.onmessage = (e: MessageEvent) => {
     const data = e.data;
 
@@ -322,6 +337,19 @@ function createRealWebWorker(
       handleFsProxy(data.__fs__, fsBridge);
       return;
     }
+
+    // First-occurrence log of every message type so we can see what emnapi
+    // is sending. Subsequent occurrences are silent to keep the log readable.
+    try {
+      const t = data && typeof data === "object"
+        ? (data.type || data.__emnapi__?.type || "(no-type-field)")
+        : "(non-object)";
+      if (!_seenMsgTypes.has(t)) {
+        _seenMsgTypes.add(t);
+        const keys = data && typeof data === "object" ? Object.keys(data).slice(0, 8).join(",") : "";
+        console.log(`[wasi-bridge] first message of type=${t} keys=${keys}`);
+      }
+    } catch { /* ignore */ }
 
     self.emit("message", data);
   };
@@ -371,13 +399,28 @@ function createRealWebWorker(
   });
 }
 
-// handles __fs__ messages from WASI workers
+// handles __fs__ messages from WASI workers.
+//
+// We always time each call and log SLOW ones (>100ms) and FAILED ones.
+// In a healthy bridge every op is sub-millisecond -- anything slower means
+// the worker is wasting time waiting on a single op (probably a 30s SAB
+// timeout firing on the worker side, but main responded fine; still useful
+// to surface). issue #54 v4 case: 60s scan = ~2 SAB timeouts.
 function handleFsProxy(
   req: { sab: Int32Array; type: string; payload: any[] },
   fsBridge: any,
 ): void {
   const { sab, type, payload } = req;
   const maxPayload = sab.buffer.byteLength - 16; // minus 16-byte header
+
+  const t0 = Date.now();
+  const argSummary = (() => {
+    try {
+      const a = payload && payload[0];
+      if (typeof a === "string") return a.length > 200 ? a.slice(0, 200) + "..." : a;
+      return JSON.stringify(a);
+    } catch { return "<arg>"; }
+  })();
 
   try {
     const fn = fsBridge[type];
@@ -439,6 +482,19 @@ function handleFsProxy(
     payloadView.set(encoded.subarray(0, writeLen));
 
     Atomics.store(sab, 0, 0); // success
+    // Count every successful bridge call so we can see whether oxide is
+    // making fs ops during a slow scan window (issue #54 v4: no bridge calls
+    // during 60s scan = oxide stuck inside WASM, no fs calls means a deeper
+    // issue than fs polyfill correctness).
+    const __counter = (globalThis as any).__nodepodFsBridgeCounter || ((globalThis as any).__nodepodFsBridgeCounter = { count: 0, slow: 0, fail: 0 });
+    __counter.count++;
+    {
+      const dt = Date.now() - t0;
+      if (dt > 100) {
+        __counter.slow++;
+        try { console.log(`[wasi-bridge] SLOW ${dt}ms ${type}(${argSummary})`); } catch {}
+      }
+    }
   } catch (err: any) {
     const errMsg = err?.message || String(err);
     const errCode = err?.code || "";
@@ -452,6 +508,14 @@ function handleFsProxy(
     payloadView.set(encoded.subarray(0, writeLen));
 
     Atomics.store(sab, 0, 1); // error
+    // Log all FS bridge errors -- a bridge call rejecting ALWAYS matters,
+    // and oxide silently swallows them which masked the real failure here.
+    const __counter = (globalThis as any).__nodepodFsBridgeCounter || ((globalThis as any).__nodepodFsBridgeCounter = { count: 0, slow: 0, fail: 0 });
+    __counter.fail++;
+    {
+      const dt = Date.now() - t0;
+      try { console.log(`[wasi-bridge] FAIL ${dt}ms ${type}(${argSummary}) -> ${errMsg}`); } catch {}
+    }
   } finally {
     Atomics.notify(sab, 0);
   }
@@ -1403,24 +1467,35 @@ const __wasiStub = { WASI: class WASI {
           const items = __fsStub.readdirSync(entry.path, { withFileTypes: true });
           let offset = 0;
           const cookieNum = Number(cookie);
-          for (let i = cookieNum; i < items.length && offset + 24 < buf_len; i++) {
+          for (let i = cookieNum; i < items.length; i++) {
             const item = items[i];
             const itemName = (item && typeof item === 'object') ? item.name : item;
             const isDir = item && typeof item.isDirectory === 'function' ? item.isDirectory() : false;
             const isSym = item && typeof item.isSymbolicLink === 'function' ? item.isSymbolicLink() : false;
             const dType = isDir ? 3 : (isSym ? 7 : 4);
+            // d_ino must be unique per (parent, name) for walkdir cycle
+            // detection to work correctly. statSync goes through MemoryVolume
+            // which assigns stable per-path inos.
+            var dino = BigInt(i + 1);
+            try {
+              var fullChild = entry.path === '/' ? '/' + itemName : entry.path + '/' + itemName;
+              var st = __fsStub.statSync(fullChild);
+              if (st && st.ino) dino = BigInt(st.ino);
+            } catch (_) {}
             const name = enc.encode(itemName);
-            const recLen = 24 + name.length;
-            if (offset + recLen > buf_len) break;
+            // Stop when we cant fit the next FULL entry. Caller refills with
+            // cookie = last d_next written. Don't write partial headers --
+            // Rust's ReadDir gets confused by them.
+            if (offset + 24 + name.length > buf_len) break;
             dv.setBigUint64(buf + offset, BigInt(i + 1), true); // d_next
-            dv.setBigUint64(buf + offset + 8, BigInt(0), true); // d_ino
+            dv.setBigUint64(buf + offset + 8, dino, true); // d_ino
             dv.setUint32(buf + offset + 16, name.length, true); // d_namlen
             dv.setUint8(buf + offset + 20, dType); // d_type
             b.set(name, buf + offset + 24);
-            offset += recLen;
+            offset += 24 + name.length;
           }
           dv.setUint32(used, offset, true);
-        } catch { dv.setUint32(used, 0, true); }
+        } catch (e) { dv.setUint32(used, 0, true); }
         return E.SUCCESS;
       },
       fd_renumber() { return E.NOSYS; },
@@ -1439,14 +1514,17 @@ const __wasiStub = { WASI: class WASI {
         const full = self._resolvePath(dirEntry.path, rel);
         try {
           const stat = __fsStub.statSync(full);
-          const now = BigInt(Date.now()) * BigInt(1000000);
           for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0);
+          // ino at offset 8 -- walkdir uses (dev,ino) for cycle detection
+          // when follow_links is on, so we need a unique value per path or
+          // every file looks like the same identity and gets dropped.
+          if (stat && stat.ino) dv.setBigUint64(buf + 8, BigInt(stat.ino), true);
           dv.setUint8(buf + 16, stat.isDirectory() ? 3 : 4);
           dv.setBigUint64(buf + 32, BigInt(stat.size || 0), true);
           dv.setBigUint64(buf + 48, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
           dv.setBigUint64(buf + 56, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
           return E.SUCCESS;
-        } catch {
+        } catch (e) {
           return E.NOENT;
         }
       },

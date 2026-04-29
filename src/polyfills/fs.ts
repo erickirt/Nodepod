@@ -466,6 +466,13 @@ export interface FsBridge {
   constants: FsConstantsShape;
 }
 
+// Matches the start of an RFC-3986-style URI scheme: "http://", "file://",
+// "blob:", "data:", etc. We can't just check for `://` because data: / blob:
+// URLs lack the slashes — but we only need to handle the cases where
+// stringified URLs leak into fs paths, which is always a "<scheme>:..."
+// prefix.
+const URL_SCHEME_RE = /^[a-z][a-z0-9+\-.]*:/i;
+
 function resolvePath(target: unknown, cwdFn?: () => string): string {
   let p: string;
 
@@ -487,6 +494,28 @@ function resolvePath(target: unknown, cwdFn?: () => string): string {
     p = String(target);
   } else {
     throw new TypeError(`Path must be a string or URL. Got: ${typeof target}`);
+  }
+
+  // String-form URL leaked into an fs call. This happens because nodepod's
+  // URL polyfill (parse() in src/polyfills/url.ts) auto-roots relative URLs at
+  // "http://localhost" for jiti / tailwindcss / postcss config loaders; once
+  // that URL gets stringified and handed to fs.statSync, we'd normally treat
+  // it as a relative path and prepend cwd, producing nonsense like
+  // "/app/http://localhost/app/tailwind.config.js" (this is GitHub issue #54
+  // for tailwind v3 + vite). Detect and strip the scheme/origin so the real
+  // pathname comes through.
+  if (URL_SCHEME_RE.test(p)) {
+    try {
+      const u = new globalThis.URL(p);
+      // file:// → decode pathname; http://localhost/... → pathname only.
+      // For any other scheme (data:, blob:, ...), let the fallthrough handle
+      // it; those callers should never have hit fs in the first place.
+      if (u.protocol === "file:" || u.protocol === "http:" || u.protocol === "https:") {
+        p = decodeURIComponent(u.pathname) || p;
+      }
+    } catch {
+      /* not actually a parseable URL, fall through */
+    }
   }
 
   if (!p.startsWith("/") && cwdFn) {

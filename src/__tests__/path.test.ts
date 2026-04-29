@@ -54,6 +54,40 @@ describe("path.resolve", () => {
   it("normalizes the result", () => {
     expect(path.resolve("/foo", "bar", "..", "baz")).toBe("/foo/baz");
   });
+
+  // issue #54: jiti / tailwindcss config loaders pass URL-stringified paths
+  // back into path.resolve(). Without scheme stripping these become nonsense
+  // like "/app/http://localhost/app/tailwind.config.js".
+  it("treats http://localhost-rooted URLs as absolute pathnames", () => {
+    expect(path.resolve("/app", "http://localhost/app/tailwind.config.js")).toBe(
+      "/app/tailwind.config.js",
+    );
+  });
+
+  it("treats file:// URLs as absolute pathnames", () => {
+    expect(path.resolve("/cwd", "file:///app/tailwind.config.js")).toBe(
+      "/app/tailwind.config.js",
+    );
+  });
+
+  it("handles a bare URL string passed alone", () => {
+    expect(path.resolve("http://localhost/app/foo.js")).toBe("/app/foo.js");
+  });
+});
+
+describe("path.isAbsolute", () => {
+  it("treats /-rooted paths as absolute", () => {
+    expect(path.isAbsolute("/foo")).toBe(true);
+  });
+
+  it("treats relative paths as not absolute", () => {
+    expect(path.isAbsolute("foo/bar")).toBe(false);
+  });
+
+  it("treats stringified file/http URLs as absolute", () => {
+    expect(path.isAbsolute("file:///foo")).toBe(true);
+    expect(path.isAbsolute("http://localhost/foo")).toBe(true);
+  });
 });
 
 describe("path.dirname", () => {
@@ -67,6 +101,26 @@ describe("path.dirname", () => {
 
   it('returns "." for bare filename', () => {
     expect(path.dirname("file.txt")).toBe(".");
+  });
+
+  // issue #54 root-cause regression tests: glob-parent (used by tailwindcss
+  // and many other libs) iteratively dirnames a glob pattern to find its
+  // static base. it relies on byte-accurate prefix preservation -- if we
+  // normalize before slicing, the leading `./` gets stripped and downstream
+  // `pattern.substr(base.length)` produces a shifted glob like `rc/**/*.js`
+  // instead of `**/*.js`.
+  it("preserves leading ./ in relative paths (glob-parent contract)", () => {
+    expect(path.dirname("./src/**/*.js")).toBe("./src/**");
+    expect(path.dirname("./src/**")).toBe("./src");
+    expect(path.dirname("./src")).toBe(".");
+  });
+
+  it('returns "." for "./foo" (no normalize-then-slice)', () => {
+    expect(path.dirname("./foo")).toBe(".");
+  });
+
+  it("does not mutate `..` segments", () => {
+    expect(path.dirname("../foo/bar")).toBe("../foo");
   });
 });
 
@@ -85,6 +139,11 @@ describe("path.basename", () => {
 
   it("returns last segment for directory path", () => {
     expect(path.basename("/foo/bar/")).toBe("bar");
+  });
+
+  it("preserves literal segments (no pre-normalize)", () => {
+    expect(path.basename("./src/main.tsx")).toBe("main.tsx");
+    expect(path.basename("./src/")).toBe("src");
   });
 });
 

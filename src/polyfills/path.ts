@@ -37,13 +37,33 @@ export function join(...fragments: string[]): string {
   return normalize(combined);
 }
 
+// nodepod's URL polyfill auto-roots relative URLs at "http://localhost" so
+// jiti / tailwindcss config loaders end up handing us strings like
+// "http://localhost/app/tailwind.config.js" via path.resolve(). If we treat
+// those as relative we'd produce nonsense like "/app/http://localhost/...".
+// Strip the scheme/origin to recover the real pathname (issue #54).
+const URL_SCHEME_RE = /^[a-z][a-z0-9+\-.]*:/i;
+
+function stripUrlScheme(seg: string): string {
+  if (!URL_SCHEME_RE.test(seg)) return seg;
+  try {
+    const u = new globalThis.URL(seg);
+    if (u.protocol === 'file:' || u.protocol === 'http:' || u.protocol === 'https:') {
+      const decoded = decodeURIComponent(u.pathname);
+      return decoded || seg;
+    }
+  } catch { /* not parseable, leave alone */ }
+  return seg;
+}
+
 // resolves right-to-left until an absolute path is formed
 export function resolve(...segments: string[]): string {
   let accumulated = '';
 
   for (let idx = segments.length - 1; idx >= 0; idx--) {
-    const segment = segments[idx];
-    if (!segment) continue;
+    const raw = segments[idx];
+    if (!raw) continue;
+    const segment = stripUrlScheme(raw);
     accumulated = segment + (accumulated ? '/' + accumulated : '');
     if (accumulated.charAt(0) === '/') break;
   }
@@ -62,23 +82,70 @@ export function resolve(...segments: string[]): string {
 }
 
 export function isAbsolute(targetPath: string): boolean {
-  return targetPath.charAt(0) === '/';
+  if (!targetPath) return false;
+  if (targetPath.charAt(0) === '/') return true;
+  // Stringified URLs (file:, http://localhost/..., etc.) refer to absolute
+  // resources -- don't let callers treat them as relative.
+  if (URL_SCHEME_RE.test(targetPath)) {
+    try {
+      const u = new globalThis.URL(targetPath);
+      if (u.protocol === 'file:' || u.protocol === 'http:' || u.protocol === 'https:') return true;
+    } catch { /* not a URL, fall through */ }
+  }
+  return false;
 }
 
+// Node.js path.posix.dirname does NOT normalize before slicing -- it finds
+// the last meaningful slash (skipping trailing ones) and returns the
+// substring before it. We previously called normalize() first, which stripped
+// `.` segments from `./src/**/*.js` and produced `src/**` instead of
+// `./src/**`. That corrupts callers like glob-parent (used by Tailwind and
+// many other libraries) that depend on byte-accurate prefix preservation:
+// they then do `pattern.substr(base.length)` and get a shifted glob like
+// `rc/**/*.js` instead of `**/*.js`. (This was the actual root cause of
+// issue #54's "no utility classes detected" symptom.)
 export function dirname(targetPath: string): string {
-  if (!targetPath) return '.';
-  const clean = normalize(targetPath);
-  const slashPos = clean.lastIndexOf('/');
-  if (slashPos < 0) return '.';
-  if (slashPos === 0) return '/';
-  return clean.substring(0, slashPos);
+  const len = targetPath ? targetPath.length : 0;
+  if (len === 0) return '.';
+
+  const hasRoot = targetPath.charAt(0) === '/';
+  let end = -1;
+  let matchedSlash = true;
+  for (let i = len - 1; i >= 1; i--) {
+    if (targetPath.charAt(i) === '/') {
+      if (!matchedSlash) {
+        end = i;
+        break;
+      }
+    } else {
+      matchedSlash = false;
+    }
+  }
+
+  if (end === -1) return hasRoot ? '/' : '.';
+  if (hasRoot && end === 0) return '/';
+  return targetPath.substring(0, end);
 }
 
+// Same lesson as dirname: do not normalize before slicing. We need the
+// LITERAL last segment, not a canonicalised version.
 export function basename(targetPath: string, suffix?: string): string {
-  if (!targetPath) return '';
-  const clean = normalize(targetPath);
-  let name = clean.substring(clean.lastIndexOf('/') + 1);
-  if (suffix && name.endsWith(suffix)) {
+  const len = targetPath ? targetPath.length : 0;
+  if (len === 0) return '';
+
+  // Skip trailing slashes
+  let end = len;
+  while (end > 0 && targetPath.charAt(end - 1) === '/') end--;
+  if (end === 0) return '';
+
+  // Find the last slash before `end`
+  let start = 0;
+  for (let i = end - 1; i >= 0; i--) {
+    if (targetPath.charAt(i) === '/') { start = i + 1; break; }
+  }
+
+  let name = targetPath.substring(start, end);
+  if (suffix && name.endsWith(suffix) && name.length > suffix.length) {
     name = name.substring(0, name.length - suffix.length);
   }
   return name;

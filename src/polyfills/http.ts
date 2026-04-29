@@ -615,6 +615,16 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
 
     const timeoutMs = self.timeout || TIMEOUTS.HTTP_DISPATCH_SAFETY;
     const timer = setTimeout(() => {
+      // Visible-to-the-user diagnostic: when a request stalls past the safety
+      // ceiling (300s), the user sees a 502 in the SW and "Request timeout"
+      // in our log. Tell them WHICH request, so they can correlate with the
+      // tailwind/rolldown chatter happening at that moment.
+      try {
+        const stderr = (globalThis as any).process?.stderr;
+        const line = `[nodepod] dispatchRequest TIMEOUT after ${timeoutMs}ms for ${verb} ${target} -- middleware never responded. likely a WASI worker that never resolved its sync FS bridge.\n`;
+        if (stderr && typeof stderr.write === "function") stderr.write(line);
+        else console.error(line);
+      } catch { /* ignore */ }
       reject(
         new Error(
           `dispatchRequest timed out after ${timeoutMs}ms for ${verb} ${target}`,
@@ -626,6 +636,22 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
       clearTimeout(timer);
     });
 
+    // Surface Vite/express middleware errors to BOTH console.error AND
+    // process.stderr.write so they reach the parent log even from inside a
+    // worker process. console.error from a process-worker writes via the
+    // worker's piped stdout, but process.stderr.write is the canonical Node
+    // path users tail. Without this, a 500 on /src/index.css is invisible.
+    const reportErr = (kind: "async" | "sync", err: unknown) => {
+      const msg = (err as Error)?.message || String(err);
+      const stack = (err as Error)?.stack?.split("\n").slice(0, 8).join("\n") ?? "";
+      const line = `[nodepod] dispatchRequest ${kind} error on ${verb} ${target}: ${msg}\n${stack}\n`;
+      try { console.error(line); } catch { /* ignore */ }
+      try {
+        const stderr = (globalThis as any).process?.stderr;
+        if (stderr && typeof stderr.write === "function") stderr.write(line);
+      } catch { /* ignore */ }
+    };
+
     try {
       self.emit("request", req, res);
       if (typeof self._handler === "function") {
@@ -633,7 +659,7 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
         if (result && typeof (result as any).then === "function") {
           (result as Promise<unknown>).catch((err) => {
             clearTimeout(timer);
-            console.error("[DEBUG] dispatchRequest async error:", (err as Error)?.message || err, (err as Error)?.stack?.split("\n").slice(0, 5).join("\n"));
+            reportErr("async", err);
             if (!res.headersSent) {
               try {
                 res.statusCode = 500;
@@ -647,7 +673,7 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
       }
     } catch (err) {
       clearTimeout(timer);
-      console.error("[DEBUG] dispatchRequest sync error:", (err as Error)?.message || err, (err as Error)?.stack?.split("\n").slice(0, 5).join("\n"));
+      reportErr("sync", err);
       if (!res.headersSent) {
         try {
           res.statusCode = 500;

@@ -560,6 +560,16 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
         }
       } else if (entry.kind === FdKind.PreopenDir) {
         filetype = FILETYPE_DIRECTORY;
+        // Fetch ino so directory entries also get unique identities. Walkers
+        // that follow_links use (dev,ino) for cycle detection and would
+        // collapse multiple opened-directory fds otherwise.
+        if (fs && entry.path) {
+          try {
+            const stat = fs.statSync(entry.path);
+            if (stat.ino) ino = BigInt(stat.ino);
+            if (stat.nlink) nlink = BigInt(stat.nlink);
+          } catch { /* ignore */ }
+        }
       }
 
       // filestat layout: u64 dev, u64 ino, u8 filetype (at +16), u64 nlink, u64 size,
@@ -775,40 +785,40 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
         const mem = bytes();
         let offset = buf_ptr;
         const end = buf_ptr + buf_len;
-        let idx = 0;
         const start = Number(cookie);
 
         for (let i = start; i < entries.length; i++) {
           const name = entries[i];
           const nameBytes = encoder.encode(name);
 
-          // dirent: u64 d_next, u64 d_ino, u32 d_namlen, u8 d_type, then name
-          const direntSize = 24 + nameBytes.length;
-          if (offset + 24 > end) break; // not enough space for header
+          // dirent: u64 d_next, u64 d_ino, u32 d_namlen, u8 d_type, then name.
+          // Stop cleanly when we can't fit the next FULL entry; the caller
+          // (Rust std::fs::ReadDir) refills with cookie = last d_next written.
+          // No partial-header padding -- that confuses Rust's iterator on the
+          // refill path.
+          if (offset + 24 + nameBytes.length > end) break;
 
           dv.setBigUint64(offset, BigInt(i + 1), true); // d_next
-          dv.setBigUint64(offset + 8, BigInt(i + 1), true); // d_ino (fake)
 
-          dv.setUint32(offset + 16, nameBytes.length, true); // d_namlen
-
-          // determine type
+          // Use real ino from stat. Walkers using `walkdir` with
+          // follow_links(true) deduplicate by (dev, ino); shared inos collapse
+          // sibling entries as a "cycle". MemoryVolume._inoFor() returns
+          // unique-per-path inos for this reason.
           let dtype = FILETYPE_REGULAR_FILE;
+          let dino = BigInt(i + 1);
           try {
             const st = fs.statSync(joinPath(entry.path, name));
             if (st.isDirectory()) dtype = FILETYPE_DIRECTORY;
             else if (st.isSymbolicLink()) dtype = FILETYPE_SYMBOLIC_LINK;
+            if (st.ino) dino = BigInt(st.ino);
           } catch {
-            /* default to regular */
+            /* ignore - default to regular file with cookie-based ino */
           }
+          dv.setBigUint64(offset + 8, dino, true); // d_ino
+          dv.setUint32(offset + 16, nameBytes.length, true); // d_namlen
           dv.setUint8(offset + 20, dtype); // d_type
-
-          // write name (may be partial if buf too small)
-          const nameCopy = Math.min(nameBytes.length, end - (offset + 24));
-          if (nameCopy > 0)
-            mem.set(nameBytes.subarray(0, nameCopy), offset + 24);
-
-          offset += 24 + nameCopy;
-          idx++;
+          mem.set(nameBytes, offset + 24);
+          offset += 24 + nameBytes.length;
         }
 
         dv.setUint32(bufused_out, offset - buf_ptr, true);
@@ -1055,7 +1065,6 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
         const wantTrunc = (oflags & OFLAGS_TRUNC) !== 0;
 
         let exists = fs.existsSync(fullPath);
-
         if (wantExcl && exists) return ERRNO_EXIST;
 
         if (wantDir) {

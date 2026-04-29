@@ -907,13 +907,16 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
         const entry = pending.get(id);
         pending.delete(id);
         // port never answered, likely stale (tab closed without pagehide).
-        // evict so the next request doesn't waste another 30s on it
+        // evict so the next request doesn't waste another long wait on it.
+        // Bumped 30s -> 300s so cold tailwind v4 / rolldown WASI workers (which
+        // can take 1-2 minutes on first request) don't get cut off here while
+        // the main thread is still in HTTP_DISPATCH_SAFETY (300s).
         if (entry.port && ports.has(entry.port)) {
           cleanupPort(entry.port);
         }
         reject(new Error("Request timeout: " + path));
       }
-    }, 30000);
+    }, 300000);
   });
 
   try {
