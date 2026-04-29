@@ -57,4 +57,5 @@ createServer((req, res) => {
   console.log(`  Multi-boot race (#39):http://localhost:${port}/examples/multi-boot-race/`);
   console.log(`  Tailwind v4 (#54):    http://localhost:${port}/examples/issue-54-tailwind-v4/`);
   console.log(`  Tailwind v3 + vite 8: http://localhost:${port}/examples/tailwind-v3-test/`);
+  console.log(`  typebox 1.x (#56):    http://localhost:${port}/examples/issue-56-typebox-1x/`);
 });

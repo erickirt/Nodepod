@@ -354,9 +354,9 @@ function convertViaAst(source: string, filePath: string): string {
     output = output.slice(0, s) + r + output.slice(e);
 
   if (hasExportDecl) {
-    output =
-      'Object.defineProperty(exports, "__esModule", { value: true });\n' +
-      output;
+    // wrapper sets __esModule in outer scope (see ESM_SENTINEL). doing it
+    // here breaks if user code shadows Object (eg typebox 1.x). #56
+    output = ESM_SENTINEL + output;
   }
 
   // .mjs files with `const require = createRequire(...)` hit TDZ after esmToCjs
@@ -364,6 +364,9 @@ function convertViaAst(source: string, filePath: string): string {
 
   return output;
 }
+
+// stamped by convertModuleSyntax, stripped by buildModuleWrapper. #56
+const ESM_SENTINEL = "/*@nodepod-esm*/\n";
 
 // Demote `const/let require =` to plain assignment to avoid TDZ with esmToCjs-generated require() calls
 function demoteLexicalRequire(code: string): string {
@@ -392,6 +395,10 @@ function buildModuleWrapper(
 
   const promiseVar = useNativePromise ? "globalThis.Promise" : "$SyncPromise";
   const fnKeyword = isAsync ? "async function" : "function";
+
+  // strip sentinel, emit __esModule in outer scope below
+  const isEsmModule = code.startsWith(ESM_SENTINEL);
+  if (isEsmModule) code = code.slice(ESM_SENTINEL.length);
 
   let vars = `var exports = $exports;
 var require = $require;
@@ -438,6 +445,11 @@ async function __wasmInstantiate(moduleOrBytes, imports) {
 }
 `;
   }
+  if (isEsmModule) {
+    // runs in outer scope, above the inner IIFE that holds user code
+    vars += `Object.defineProperty($exports, "__esModule", { value: true });
+`;
+  }
 
   return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $SyncPromise) {
 ${vars}return (${fnKeyword}() {
@@ -466,9 +478,8 @@ function convertViaRegex(source: string, filePath: string): string {
   if (hasImport || hasExport) {
     output = esmToCjs(output);
     if (hasExport) {
-      output =
-        'Object.defineProperty(exports, "__esModule", { value: true });\n' +
-        output;
+      // see ESM_SENTINEL above. #56
+      output = ESM_SENTINEL + output;
     }
   }
 

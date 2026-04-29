@@ -54,10 +54,17 @@ export function collectEsmCjsPatches(
   const hasDefaultExport = ast.body.some(
     (n: any) => n.type === "ExportDefaultDeclaration",
   );
+  // ExportAllDeclaration covers `export * from` and `export * as X from`,
+  // both produce named exports. without counting them mixed with a default
+  // export, `module.exports = X` ends up clobbering the named ones. #56
   const hasNamedExport = ast.body.some(
-    (n: any) => n.type === "ExportNamedDeclaration",
+    (n: any) =>
+      n.type === "ExportNamedDeclaration" || n.type === "ExportAllDeclaration",
   );
   const mixedExports = hasDefaultExport && hasNamedExport;
+
+  // collected during the walk, prepended at the bottom of this fn
+  const hoistedFunctionExports: string[] = [];
 
   for (const node of ast.body) {
     if (node.type === "ImportDeclaration") {
@@ -145,12 +152,18 @@ export function collectEsmCjsPatches(
     } else if (node.type === "ExportNamedDeclaration") {
       if (node.declaration) {
         const decl = node.declaration;
-        if (
-          decl.type === "FunctionDeclaration" ||
-          decl.type === "ClassDeclaration"
-        ) {
+        if (decl.type === "FunctionDeclaration") {
           const name = decl.id.name;
-          // Non-overlapping patches: remove "export " prefix, append binding
+          // assignment goes at the top via hoistedFunctionExports below.
+          // function decls are value-hoisted so prepending exports.X = X
+          // before the body works, which fixes circular ESM (typebox's
+          // instantiate.mjs <-> awaited/instantiate.mjs). #56
+          patches.push([node.start, decl.start, ""]);
+          hoistedFunctionExports.push(name);
+        } else if (decl.type === "ClassDeclaration") {
+          const name = decl.id.name;
+          // classes are TDZ, can't assign before the decl. keep trailing.
+          // circular imports of class exports can still see undefined.
           patches.push([node.start, decl.start, ""]);
           patches.push([
             node.end,
@@ -235,6 +248,17 @@ export function collectEsmCjsPatches(
         ]);
       }
     }
+  }
+
+  // hoist exports.X = X for every `export function X` so circular consumers
+  // see populated exports during a partial load. function decls are
+  // value-hoisted, classes/let/const arent (TDZ) so they stay trailing. #56
+  if (hoistedFunctionExports.length > 0) {
+    const prefix =
+      hoistedFunctionExports
+        .map((n) => `exports.${n} = ${n};`)
+        .join("\n") + "\n";
+    patches.push([0, 0, prefix]);
   }
 }
 
