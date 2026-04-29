@@ -62,10 +62,8 @@
     <div id="output"></div>
   </div>
 
-  <!-- ===== inline-ESM repro: mimics typebox's import-that-shadows-global pattern ===== -->
+  <!-- inline ESM repro: mimics typebox's shadowing-import pattern -->
 
-  <!-- types/object.mjs - mimics typebox/build/type/types/object.mjs which exports
-       a function literally named "Object" -->
   <script id="file-inline-types-object" type="text/plain">// mimics typebox/build/type/types/object.mjs
 export function Object(properties, options = {}) {
   return { '~kind': 'Object', type: 'object', properties, options };
@@ -79,7 +77,6 @@ export function ObjectOptions(type) {
 }
 </script>
 
-  <!-- types/array.mjs - same pattern: an export named after a global -->
   <script id="file-inline-types-array" type="text/plain">// mimics typebox/build/type/types/array.mjs
 export function Array(items, options = {}) {
   return { '~kind': 'Array', type: 'array', items, options };
@@ -89,15 +86,10 @@ export function IsArray(value) {
 }
 </script>
 
-  <!-- engine/instantiate.mjs - mimics typebox/build/type/engine/instantiate.mjs:
-       imports Object & Array (both shadow globals), then the body uses the
-       imported names. when nodepod's loader rewrites this to
-       `const { Object } = require('./types/object.mjs');` the const binding
-       hoists into the module scope; if anything else in the body or wrapper
-       references `Object` before that line evaluates, you get TDZ. -->
-  <script id="file-inline-engine-instantiate" type="text/plain">// mimics typebox/build/type/engine/instantiate.mjs (line 20 imports Object)
-import { Object, IsObject, ObjectOptions } from './types/object.mjs';
-import { Array, IsArray } from './types/array.mjs';
+  <script id="file-inline-engine-instantiate" type="text/plain">// mimics typebox/build/type/engine/instantiate.mjs (imports Object/Array)
+// '../types/' because this file lives at /app/engine/, mirrors typebox layout
+import { Object, IsObject, ObjectOptions } from '../types/object.mjs';
+import { Array, IsArray } from '../types/array.mjs';
 
 export function Instantiate(type) {
   if (IsObject(type)) return Object(type.properties, ObjectOptions(type));
@@ -107,7 +99,6 @@ export function Instantiate(type) {
 export const PROBE = 'instantiate-loaded';
 </script>
 
-  <!-- entry that loads the engine -->
   <script id="file-inline-main" type="text/plain">import { Instantiate, PROBE } from './engine/instantiate.mjs';
 console.log('main: loaded engine. PROBE=' + PROBE);
 const obj = { '~kind': 'Object', type: 'object', properties: { x: { type: 'number' } } };
@@ -115,7 +106,8 @@ const out = Instantiate(obj);
 console.log('main: Instantiate returned', JSON.stringify(out));
 </script>
 
-  <!-- ===== typebox-direct repro: install just typebox@^1 and require it ===== -->
+  <!-- direct typebox repro: npm install + require -->
+
 
   <script id="file-typebox-package-json" type="text/plain">{
   "name": "typebox-min-repro",
@@ -128,9 +120,7 @@ console.log('main: Instantiate returned', JSON.stringify(out));
 }
 </script>
 
-  <!-- mirrors what pi-coding-agent does: just require typebox. the failure
-       happens during module evaluation, not at any later usage. -->
-  <script id="file-typebox-runner" type="text/plain">// reproduces issue 56: requiring typebox 1.x triggers TDZ during module load
+  <script id="file-typebox-runner" type="text/plain">// pre-fix this required-and-died at module eval (TDZ)
 console.log('about to require typebox...');
 try {
   const tb = require('typebox');
@@ -142,8 +132,7 @@ try {
 }
 </script>
 
-  <!-- esm variant of the same -->
-  <script id="file-typebox-runner-esm" type="text/plain">// esm variant: import instead of require
+  <script id="file-typebox-runner-esm" type="text/plain">// esm variant: import() instead of require
 console.log('about to import typebox...');
 try {
   const tb = await import('typebox');
