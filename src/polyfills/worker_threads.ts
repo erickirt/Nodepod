@@ -275,8 +275,8 @@ Worker.prototype.getHeapSnapshot = function getHeapSnapshot(): Promise<unknown> 
 //
 // CRITICAL: the onmessage setter must NOT add an EventEmitter listener
 // emnapi (ENVIRONMENT_IS_NODE=true) already calls worker.on('message', data => worker.onmessage?.({data}))
-// if this setter ALSO added a listener, each message would fire twice — for 'spawn-thread' that means
-// duplicate workers calling wasi_thread_start with the same startArg → TLS corruption / "current thread handle already set"
+// if this setter ALSO added a listener, each message would fire twice. for 'spawn-thread' that means
+// duplicate workers calling wasi_thread_start with the same startArg, then TLS corruption / "current thread handle already set"
 // fix: setter just stores the handler, emnapi's explicit on('message') dispatches exactly once
 {
   const _onmessageSym = Symbol("onmessage");

@@ -180,8 +180,9 @@ export function createNapiWorkerFactory(
     opts?: any,
   ) {
     const scriptStr = typeof script === "string" ? script : script.href;
+    const isWasi = isNapiWasiWorkerScript(scriptStr, vol);
 
-    if (isNapiWasiWorkerScript(scriptStr, vol)) {
+    if (isWasi) {
       // threaded wasi needs SAB for Atomics.wait, would deadlock without it
       if (!sabEnabled) {
         queueMicrotask(() => {
@@ -371,8 +372,10 @@ function createRealWebWorker(
   });
 }
 
-// handles __fs__ messages from WASI workers
-function handleFsProxy(
+// handles __fs__ messages from WASI workers. exported so Nodepod.boot can
+// subscribe to the broadcast channel and service the same protocol from the
+// browser tab when the spawned process is busy in sync WASM
+export function handleFsProxy(
   req: { sab: Int32Array; type: string; payload: any[] },
   fsBridge: any,
 ): void {
@@ -408,6 +411,19 @@ function handleFsProxy(
         _isDir: result.isDirectory(),
         _isSymlink: typeof result.isSymbolicLink === "function" ? result.isSymbolicLink() : false,
       };
+    }
+
+    // flatten Dirent[] from readdirSync({withFileTypes:true}). structured
+    // clone strips the prototype methods so the worker would otherwise get
+    // [{name}, ...] with no type info, and rust readdir handlers panic.
+    if (type === "readdirSync" && Array.isArray(result) && result.length > 0 && typeof result[0] === "object" && result[0] !== null && typeof (result[0] as any).isFile === "function") {
+      result = (result as any[]).map((d) => ({
+        name: d.name,
+        parentPath: d.parentPath || d.path,
+        _isFile: typeof d.isFile === "function" ? d.isFile() : false,
+        _isDir: typeof d.isDirectory === "function" ? d.isDirectory() : false,
+        _isSymlink: typeof d.isSymbolicLink === "function" ? d.isSymbolicLink() : false,
+      }));
     }
 
     // encode into the SAB
@@ -834,16 +850,30 @@ __pathStub.posix = __pathStub;
 //   [3] = reserved
 const __FS_DEFAULT_SAB = 16 + 65536; // 16 header + 64KB payload (enough for most ops)
 
+// fs proxy goes through BroadcastChannel direct to the browser tab so we
+// dont deadlock when the spawned process is busy in sync WASM (oxide.scan
+// etc). unref the channel because BroadcastChannel pins the event loop.
+const __wasiFsBC = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('nodepod-wasi-fs') : null;
+if (__wasiFsBC && typeof __wasiFsBC.unref === 'function') {
+  try { __wasiFsBC.unref(); } catch {}
+}
+
 function __fsSyncCall(type, args, sabSize) {
   const size = sabSize || __FS_DEFAULT_SAB;
   const sab = new SharedArrayBuffer(size);
   const ctrl = new Int32Array(sab, 0, 4);
   Atomics.store(ctrl, 0, -1); // pending
 
-  // Post request to main thread (use native postMessage to avoid infinite recursion)
-  __nativePostMessage({ __fs__: { sab: ctrl, type: type, payload: args || [] } });
+  const message = { __fs__: { sab: ctrl, type: type, payload: args || [] } };
 
-  // Block until main thread responds
+  if (__wasiFsBC) {
+    __wasiFsBC.postMessage(message);
+  } else {
+    // fallback for environments without BroadcastChannel. only works when
+    // the parent process isnt blocked.
+    __nativePostMessage(message);
+  }
+
   const result = Atomics.wait(ctrl, 0, -1, 30000); // 30s timeout
   if (result === 'timed-out') {
     throw Object.assign(new Error('fs.' + type + ' timed out (30s)'), { code: 'ETIMEDOUT' });
@@ -955,7 +985,30 @@ const __fsStub = {
   existsSync(p) { try { __fsSyncCall('statSync', [p]); return true; } catch { return false; } },
   statSync(p) { return __makeStatObj(__fsSyncCall('statSync', [p])); },
   lstatSync(p) { return __makeStatObj(__fsSyncCall('lstatSync', [p])); },
-  readdirSync(p, opts) { return __fsSyncCall('readdirSync', [p, opts]) || []; },
+  readdirSync(p, opts) {
+    const result = __fsSyncCall('readdirSync', [p, opts]) || [];
+    // When opts.withFileTypes is set the main thread returns flattened Dirent
+    // descriptors -- objects with name, _isFile, _isDir, _isSymlink. We
+    // reconstruct full Dirent-shaped objects with the methods callers expect.
+    const wantTypes = opts && typeof opts === 'object' && opts.withFileTypes;
+    if (wantTypes && Array.isArray(result) && result.length && typeof result[0] === 'object') {
+      return result.map(function(d) {
+        return {
+          name: d.name,
+          parentPath: d.parentPath || p,
+          path: d.parentPath || p,
+          isFile: function() { return !!d._isFile; },
+          isDirectory: function() { return !!d._isDir; },
+          isSymbolicLink: function() { return !!d._isSymlink; },
+          isBlockDevice: function() { return false; },
+          isCharacterDevice: function() { return false; },
+          isFIFO: function() { return false; },
+          isSocket: function() { return false; },
+        };
+      });
+    }
+    return result;
+  },
   mkdirSync(p, opts) { return __fsSyncCall('mkdirSync', [p, opts]); },
   unlinkSync(p) { return __fsSyncCall('unlinkSync', [p]); },
   rmdirSync(p) { return __fsSyncCall('rmdirSync', [p]); },
@@ -1358,22 +1411,40 @@ const __wasiStub = { WASI: class WASI {
         const entry = self._fds.get(fd);
         if (!entry || !entry.path) { dv.setUint32(used, 0, true); return E.SUCCESS; }
         try {
-          const names = __fsStub.readdirSync(entry.path);
+          // Ask for Dirent objects so we can populate d_type accurately.
+          // d_type values per WASI: 3=DIRECTORY, 4=REGULAR_FILE, 7=SYMBOLIC_LINK.
+          const items = __fsStub.readdirSync(entry.path, { withFileTypes: true });
           let offset = 0;
           const cookieNum = Number(cookie);
-          for (let i = cookieNum; i < names.length && offset + 24 < buf_len; i++) {
-            const name = enc.encode(names[i]);
-            const recLen = 24 + name.length;
-            if (offset + recLen > buf_len) break;
+          for (let i = cookieNum; i < items.length; i++) {
+            const item = items[i];
+            const itemName = (item && typeof item === 'object') ? item.name : item;
+            const isDir = item && typeof item.isDirectory === 'function' ? item.isDirectory() : false;
+            const isSym = item && typeof item.isSymbolicLink === 'function' ? item.isSymbolicLink() : false;
+            const dType = isDir ? 3 : (isSym ? 7 : 4);
+            // d_ino must be unique per (parent, name) for walkdir cycle
+            // detection to work correctly. statSync goes through MemoryVolume
+            // which assigns stable per-path inos.
+            var dino = BigInt(i + 1);
+            try {
+              var fullChild = entry.path === '/' ? '/' + itemName : entry.path + '/' + itemName;
+              var st = __fsStub.statSync(fullChild);
+              if (st && st.ino) dino = BigInt(st.ino);
+            } catch (_) {}
+            const name = enc.encode(itemName);
+            // Stop when we cant fit the next FULL entry. Caller refills with
+            // cookie = last d_next written. Don't write partial headers --
+            // Rust's ReadDir gets confused by them.
+            if (offset + 24 + name.length > buf_len) break;
             dv.setBigUint64(buf + offset, BigInt(i + 1), true); // d_next
-            dv.setBigUint64(buf + offset + 8, BigInt(0), true); // d_ino
+            dv.setBigUint64(buf + offset + 8, dino, true); // d_ino
             dv.setUint32(buf + offset + 16, name.length, true); // d_namlen
-            dv.setUint8(buf + offset + 20, 4); // d_type = regular file (best guess)
+            dv.setUint8(buf + offset + 20, dType); // d_type
             b.set(name, buf + offset + 24);
-            offset += recLen;
+            offset += 24 + name.length;
           }
           dv.setUint32(used, offset, true);
-        } catch { dv.setUint32(used, 0, true); }
+        } catch (e) { dv.setUint32(used, 0, true); }
         return E.SUCCESS;
       },
       fd_renumber() { return E.NOSYS; },
@@ -1392,14 +1463,17 @@ const __wasiStub = { WASI: class WASI {
         const full = self._resolvePath(dirEntry.path, rel);
         try {
           const stat = __fsStub.statSync(full);
-          const now = BigInt(Date.now()) * BigInt(1000000);
           for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0);
+          // ino at offset 8 -- walkdir uses (dev,ino) for cycle detection
+          // when follow_links is on, so we need a unique value per path or
+          // every file looks like the same identity and gets dropped.
+          if (stat && stat.ino) dv.setBigUint64(buf + 8, BigInt(stat.ino), true);
           dv.setUint8(buf + 16, stat.isDirectory() ? 3 : 4);
           dv.setBigUint64(buf + 32, BigInt(stat.size || 0), true);
           dv.setBigUint64(buf + 48, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
           dv.setBigUint64(buf + 56, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
           return E.SUCCESS;
-        } catch {
+        } catch (e) {
           return E.NOENT;
         }
       },

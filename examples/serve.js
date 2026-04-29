@@ -54,4 +54,6 @@ createServer((req, res) => {
   console.log(`  Shared FS attach:     http://localhost:${port}/examples/shared-fs-attach/`);
   console.log(`  SAB opt-out:          http://localhost:${port}/examples/sab-opt-out/`);
   console.log(`  Multi-boot race (#39):http://localhost:${port}/examples/multi-boot-race/`);
+  console.log(`  Tailwind v4 (#54):    http://localhost:${port}/examples/issue-54-tailwind-v4/`);
+  console.log(`  Tailwind v3 + vite 8: http://localhost:${port}/examples/tailwind-v3-test/`);
 });

@@ -560,6 +560,14 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
         }
       } else if (entry.kind === FdKind.PreopenDir) {
         filetype = FILETYPE_DIRECTORY;
+        // unique ino so walkdir with follow_links doesnt collapse opened dirs
+        if (fs && entry.path) {
+          try {
+            const stat = fs.statSync(entry.path);
+            if (stat.ino) ino = BigInt(stat.ino);
+            if (stat.nlink) nlink = BigInt(stat.nlink);
+          } catch {}
+        }
       }
 
       // filestat layout: u64 dev, u64 ino, u8 filetype (at +16), u64 nlink, u64 size,
@@ -775,40 +783,34 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
         const mem = bytes();
         let offset = buf_ptr;
         const end = buf_ptr + buf_len;
-        let idx = 0;
         const start = Number(cookie);
 
         for (let i = start; i < entries.length; i++) {
           const name = entries[i];
           const nameBytes = encoder.encode(name);
 
-          // dirent: u64 d_next, u64 d_ino, u32 d_namlen, u8 d_type, then name
-          const direntSize = 24 + nameBytes.length;
-          if (offset + 24 > end) break; // not enough space for header
+          // dirent: u64 d_next, u64 d_ino, u32 d_namlen, u8 d_type, then name.
+          // stop on the first entry that wont fit, the caller (rust ReadDir)
+          // refills with cookie = last d_next written. dont write partial
+          // headers, that confuses the iterator on the refill path.
+          if (offset + 24 + nameBytes.length > end) break;
 
           dv.setBigUint64(offset, BigInt(i + 1), true); // d_next
-          dv.setBigUint64(offset + 8, BigInt(i + 1), true); // d_ino (fake)
 
-          dv.setUint32(offset + 16, nameBytes.length, true); // d_namlen
-
-          // determine type
+          // real ino from stat, see MemoryVolume._inoFor for why
           let dtype = FILETYPE_REGULAR_FILE;
+          let dino = BigInt(i + 1);
           try {
             const st = fs.statSync(joinPath(entry.path, name));
             if (st.isDirectory()) dtype = FILETYPE_DIRECTORY;
             else if (st.isSymbolicLink()) dtype = FILETYPE_SYMBOLIC_LINK;
-          } catch {
-            /* default to regular */
-          }
+            if (st.ino) dino = BigInt(st.ino);
+          } catch {}
+          dv.setBigUint64(offset + 8, dino, true); // d_ino
+          dv.setUint32(offset + 16, nameBytes.length, true); // d_namlen
           dv.setUint8(offset + 20, dtype); // d_type
-
-          // write name (may be partial if buf too small)
-          const nameCopy = Math.min(nameBytes.length, end - (offset + 24));
-          if (nameCopy > 0)
-            mem.set(nameBytes.subarray(0, nameCopy), offset + 24);
-
-          offset += 24 + nameCopy;
-          idx++;
+          mem.set(nameBytes, offset + 24);
+          offset += 24 + nameBytes.length;
         }
 
         dv.setUint32(bufused_out, offset - buf_ptr, true);
@@ -1055,7 +1057,6 @@ export const WASI = function WASI(this: any, options?: WASIOptions) {
         const wantTrunc = (oflags & OFLAGS_TRUNC) !== 0;
 
         let exists = fs.existsSync(fullPath);
-
         if (wantExcl && exists) return ERRNO_EXIST;
 
         if (wantDir) {

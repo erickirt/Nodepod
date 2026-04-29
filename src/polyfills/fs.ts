@@ -466,6 +466,10 @@ export interface FsBridge {
   constants: FsConstantsShape;
 }
 
+// matches an RFC-3986 URI scheme prefix. data:/blob: dont have // so we
+// just detect "<scheme>:" since thats all we ever see leak into fs paths.
+const URL_SCHEME_RE = /^[a-z][a-z0-9+\-.]*:/i;
+
 function resolvePath(target: unknown, cwdFn?: () => string): string {
   let p: string;
 
@@ -487,6 +491,19 @@ function resolvePath(target: unknown, cwdFn?: () => string): string {
     p = String(target);
   } else {
     throw new TypeError(`Path must be a string or URL. Got: ${typeof target}`);
+  }
+
+  // url polyfill in src/polyfills/url.ts auto-roots relative URLs at
+  // "http://localhost" so jiti / tailwind / postcss can hand us strings
+  // like "http://localhost/app/foo.js" via fs.statSync. without stripping
+  // we'd get nonsense like "/app/http://localhost/app/foo.js".
+  if (URL_SCHEME_RE.test(p)) {
+    try {
+      const u = new globalThis.URL(p);
+      if (u.protocol === "file:" || u.protocol === "http:" || u.protocol === "https:") {
+        p = decodeURIComponent(u.pathname) || p;
+      }
+    } catch {}
   }
 
   if (!p.startsWith("/") && cwdFn) {

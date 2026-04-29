@@ -177,6 +177,19 @@ export class MemoryVolume {
   private tree: VolumeNode;
   private textEncoder = new TextEncoder();
   private textDecoder = new TextDecoder();
+  // unique ino per path. rust walkdir with follow_links(true) tracks visited
+  // (dev,ino) pairs to break cycles, so ino=0 for everything makes it drop
+  // every file as "already visited".
+  private _inos = new Map<string, number>();
+  private _nextIno = 1;
+  private _inoFor(path: string): number {
+    let n = this._inos.get(path);
+    if (n === undefined) {
+      n = this._nextIno++;
+      this._inos.set(path, n);
+    }
+    return n;
+  }
 
   // decode arbitrary input to UTF-8. handles Uint8Array (including SAB-backed
   // which TextDecoder rejects directly), ArrayBuffer, other TypedArray views,
@@ -616,7 +629,7 @@ export class MemoryVolume {
       uid: MOCK_IDS.UID,
       gid: MOCK_IDS.GID,
       dev: 0,
-      ino: 0,
+      ino: this._inoFor(norm),
       rdev: 0,
       blksize: MOCK_FS.BLOCK_SIZE,
       blocks: Math.ceil(fileSize / MOCK_FS.BLOCK_CALC_SIZE),
@@ -659,7 +672,7 @@ export class MemoryVolume {
         uid: 1000,
         gid: 1000,
         dev: 0,
-        ino: 0,
+        ino: this._inoFor(norm),
         rdev: 0,
         blksize: MOCK_FS.BLOCK_SIZE,
         blocks: 0,

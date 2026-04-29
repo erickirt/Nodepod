@@ -54,6 +54,24 @@ describe("path.resolve", () => {
   it("normalizes the result", () => {
     expect(path.resolve("/foo", "bar", "..", "baz")).toBe("/foo/baz");
   });
+
+  // jiti / tailwind config loaders pass URL-strings back into path.resolve.
+  // without scheme stripping these become "/app/http://localhost/..." nonsense
+  it("treats http://localhost-rooted URLs as absolute pathnames", () => {
+    expect(path.resolve("/app", "http://localhost/app/tailwind.config.js")).toBe(
+      "/app/tailwind.config.js",
+    );
+  });
+
+  it("treats file:// URLs as absolute pathnames", () => {
+    expect(path.resolve("/cwd", "file:///app/tailwind.config.js")).toBe(
+      "/app/tailwind.config.js",
+    );
+  });
+
+  it("handles a bare URL string passed alone", () => {
+    expect(path.resolve("http://localhost/app/foo.js")).toBe("/app/foo.js");
+  });
 });
 
 describe("path.dirname", () => {
@@ -67,6 +85,23 @@ describe("path.dirname", () => {
 
   it('returns "." for bare filename', () => {
     expect(path.dirname("file.txt")).toBe(".");
+  });
+
+  // glob-parent (used by tailwind, fast-glob etc) walks dirname to find the
+  // static base of a glob and slices the suffix by the base byte length. if
+  // we normalize first the leading "./" goes away and the slice is off by 2.
+  it("preserves leading ./ in relative paths (glob-parent contract)", () => {
+    expect(path.dirname("./src/**/*.js")).toBe("./src/**");
+    expect(path.dirname("./src/**")).toBe("./src");
+    expect(path.dirname("./src")).toBe(".");
+  });
+
+  it('returns "." for "./foo" (no normalize-then-slice)', () => {
+    expect(path.dirname("./foo")).toBe(".");
+  });
+
+  it("does not mutate `..` segments", () => {
+    expect(path.dirname("../foo/bar")).toBe("../foo");
   });
 });
 
@@ -85,6 +120,11 @@ describe("path.basename", () => {
 
   it("returns last segment for directory path", () => {
     expect(path.basename("/foo/bar/")).toBe("bar");
+  });
+
+  it("preserves literal segments (no pre-normalize)", () => {
+    expect(path.basename("./src/main.tsx")).toBe("main.tsx");
+    expect(path.basename("./src/")).toBe("src");
   });
 });
 
@@ -130,6 +170,11 @@ describe("path.isAbsolute", () => {
     expect(path.isAbsolute("foo")).toBe(false);
     expect(path.isAbsolute("./foo")).toBe(false);
     expect(path.isAbsolute("../foo")).toBe(false);
+  });
+
+  it("treats stringified file/http URLs as absolute", () => {
+    expect(path.isAbsolute("file:///foo")).toBe(true);
+    expect(path.isAbsolute("http://localhost/foo")).toBe(true);
   });
 });
 
